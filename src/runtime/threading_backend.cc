@@ -436,6 +436,19 @@ int MaxConcurrency() {
   return std::max(max_concurrency, 1);
 }
 
+// Per-op thread-count override, consumed by TVMBackendParallelLaunch().
+// Thread-local so a budget set for one host thread never leaks to another.
+// See TVM 0.22 CPU runtime migration design section 6.1.
+thread_local int per_op_num_threads = 0;
+
+void SetPerOpNumThreads(int num_threads) {
+  per_op_num_threads = num_threads > 0 ? num_threads : 0;
+}
+
+int GetPerOpNumThreads() { return per_op_num_threads; }
+
+void ClearPerOpNumThreads() { per_op_num_threads = 0; }
+
 // This global function can be used by disco runtime to bind processes
 // to CPUs.
 TVM_FFI_STATIC_INIT_BLOCK() {

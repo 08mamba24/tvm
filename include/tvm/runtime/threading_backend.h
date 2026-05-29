@@ -149,6 +149,29 @@ TVM_DLL void Configure(tvm::runtime::threading::ThreadGroup::AffinityMode mode, 
  */
 TVM_DLL int32_t NumThreads();
 
+/*!
+ * \brief Set a per-op thread-count override for the current host thread.
+ *
+ * When set to a positive value, `TVMBackendParallelLaunch()` uses this value as
+ * `num_task` for launches that pass `num_task == 0` (i.e. callers that did not
+ * request an explicit task count). This is the runtime injection point for the
+ * per-op adaptive thread budget described in the TVM 0.22 CPU runtime migration
+ * design (section 6.1). The override is thread-local, so a budget set for one
+ * host thread never leaks across host threads.
+ *
+ * \param num_threads Desired task count. A value <= 0 clears the override.
+ */
+TVM_DLL void SetPerOpNumThreads(int num_threads);
+/*!
+ * \brief Get the current host thread's per-op thread-count override.
+ * \return The override value, or 0 when no override is active.
+ */
+TVM_DLL int GetPerOpNumThreads();
+/*!
+ * \brief Clear the current host thread's per-op thread-count override.
+ */
+TVM_DLL void ClearPerOpNumThreads();
+
 }  // namespace threading
 
 /*!

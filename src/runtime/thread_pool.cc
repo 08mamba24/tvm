@@ -478,6 +478,14 @@ int32_t NumThreads() { return tvm::runtime::ThreadPool::ThreadLocal()->NumThread
 
 int TVMBackendParallelLaunch(FTVMParallelLambda flambda, void* cdata, int num_task) {
   int num_workers = tvm::runtime::threading::MaxConcurrency();
+  // Per-op thread-local override (TVM 0.22 CPU runtime migration design 6.1):
+  // only override when the caller did not request an explicit task count
+  // (num_task == 0), so existing callers with a fixed num_task are untouched.
+  // The override is clamped to [1, num_workers].
+  int override_num_task = tvm::runtime::threading::GetPerOpNumThreads();
+  if (override_num_task > 0 && num_task == 0) {
+    num_task = std::min(override_num_task, num_workers);
+  }
   if (num_workers == 1) {
     std::atomic<int32_t> sync_counter{0};
     TVMParallelGroupEnv env;
