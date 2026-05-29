@@ -22,12 +22,14 @@
 #include <tvm/runtime/logging.h>
 #include <tvm/runtime/threading_backend.h>
 
+#include <algorithm>
 #include <atomic>
 #include <memory>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 constexpr size_t N = 128;
 void AtomicCompute(int task_id, size_t n, std::atomic<size_t>* acc, TVMParallelGroupEnv* penv) {
@@ -191,4 +193,55 @@ TEST(ThreadingBackend, TVMBackendParallelForWithThreadingBackend) {
   for (int i = 0; i < n; ++i) {
     EXPECT_EQ(vec[i], i);
   }
+}
+
+// Phase 1 step 1: TIR-level failing test
+// Goal: verify per-op thread-local override can change TVMBackendParallelLaunch num_task
+//
+// Design doc section 6.1 defines: SetPerOpNumThreads / GetPerOpNumThreads / ClearPerOpNumThreads
+//
+// THIS TEST WILL NOT COMPILE until Phase 1 step 2 implements the override API.
+// Compilation failure is the correct red signal for step 1.
+TEST(ThreadingBackend, ThreadLocalNumTaskOverride) {
+  const int override_nthreads = 2;
+
+  std::vector<int32_t> observed_num_tasks;
+  std::mutex mu;
+
+  auto num_task_tracker = [](int task_id, TVMParallelGroupEnv* penv, void* cdata) -> int {
+    auto* ctx = reinterpret_cast<std::pair<std::vector<int32_t>*, std::mutex*>*>(cdata);
+    std::lock_guard<std::mutex> lock(*ctx->second);
+    ctx->first->push_back(penv->num_task);
+    return 0;
+  };
+
+  std::pair<std::vector<int32_t>*, std::mutex*> tracker_ctx{&observed_num_tasks, &mu};
+
+  // Case 1: Baseline - explicit num_task parameter is respected
+  const int max_concurrency = tvm::runtime::threading::MaxConcurrency();
+  if (max_concurrency < 2) {
+    GTEST_SKIP() << "Need at least 2 workers for this test";
+  }
+  const int baseline_num_task = std::min(4, max_concurrency);
+  observed_num_tasks.clear();
+  TVMBackendParallelLaunch(num_task_tracker, &tracker_ctx, baseline_num_task);
+  EXPECT_EQ(observed_num_tasks.size(), baseline_num_task)
+      << "num_task=" << baseline_num_task << " should result in " << baseline_num_task << " workers";
+  for (int32_t nt : observed_num_tasks) {
+    EXPECT_EQ(nt, baseline_num_task) << "each worker should see num_task=" << baseline_num_task;
+  }
+
+  // Case 2: Per-op thread-local override (KEY FAILING TEST - compilation error until step 2)
+  // The three API calls below use design-doc names from section 6.1.
+  // They do not exist yet in v0.22.0, so this test fails to compile.
+  // This compilation failure DRIVES step 2: implement SetPerOpNumThreads / GetPerOp / ClearPerOp.
+  observed_num_tasks.clear();
+  tvm::runtime::threading::SetPerOpNumThreads(override_nthreads);
+  TVMBackendParallelLaunch(num_task_tracker, &tracker_ctx, 0);
+  EXPECT_EQ(observed_num_tasks.size(), override_nthreads)
+      << "override should limit workers to " << override_nthreads;
+  for (int32_t nt : observed_num_tasks) {
+    EXPECT_EQ(nt, override_nthreads) << "each worker should see override num_task=" << override_nthreads;
+  }
+  tvm::runtime::threading::ClearPerOpNumThreads();
 }
