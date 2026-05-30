@@ -269,6 +269,15 @@ class ThreadPool {
     Init();
   }
 
+  // Phase 1 step 3: explicit thread count constructor for ONE_POOL instance pools
+  explicit ThreadPool(int num_workers) : num_workers_(num_workers) {
+    const char* exclude_worker0 = getenv("TVM_EXCLUDE_WORKER0");
+    if (exclude_worker0 && atoi(exclude_worker0) == 0) {
+      exclude_worker0_ = false;
+    }
+    Init();
+  }
+
   ~ThreadPool() {
     for (std::unique_ptr<SpscTaskQueue>& q : queues_) {
       q->SignalForKill();
