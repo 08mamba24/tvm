@@ -1611,52 +1611,58 @@ class Sqrt(OnnxOpConverter):
 
 
 class MultiInputBase(OnnxOpConverter):
-    """Converts an onnx MultiInputBase node into an equivalent Relax expression."""
+    """Converts a variadic element-wise onnx op (Min/Max/Sum) into Relax.
 
-    numpy_op: Callable = None
-    relax_op: Callable = None
+    ONNX Min/Max/Sum/Mean use numpy-style multidirectional broadcasting across
+    their inputs, so fold the inputs with a broadcast-aware binary relax op.
+
+    The previous implementation used expand_dims(axis=0) + concat(axis=0) +
+    reduce, which required every input to share the same ndim and crashed on
+    e.g. ``Min(x, 0.99999)`` where one operand is a scalar constant:
+    "Concat expects all input tensors to have same ndim ... ndim 3 and 1".
+    Constant inputs are left to the standard FoldConstant pass.
+    """
+
+    relax_binary_op: Callable = None
 
     @classmethod
     def _impl_v1(cls, bb, inputs, attr, params):
-        if cls.numpy_op is None or cls.relax_op is None:
-            raise NotImplementedError("numpy_op and relax_op must be defined for MultiInputBase")
-        if all([isinstance(inp, relax.Constant) for inp in inputs]):
-            np_inputs = [inp.data.numpy() for inp in inputs]
-            output = cls.numpy_op(*np_inputs)  # pylint: disable=not-callable
-            return relax.const(output, output.dtype)
-
-        # Expand inputs, stack them, then perform minimum over the new axis.
-        inputs = [bb.normalize(relax.op.expand_dims(i, axis=0)) for i in inputs]
-        stacked_tensor = relax.op.concat(inputs, axis=0)
-        return cls.relax_op(stacked_tensor, axis=0)  # pylint: disable=not-callable
+        if cls.relax_binary_op is None:
+            raise NotImplementedError("relax_binary_op must be defined for MultiInputBase")
+        result = inputs[0]
+        for operand in inputs[1:]:
+            result = bb.normalize(cls.relax_binary_op(result, operand))  # pylint: disable=not-callable
+        return result
 
 
 class Min(MultiInputBase):
     """Converts an onnx Min node into an equivalent Relax expression."""
 
-    numpy_op = _np.min
-    relax_op = relax.op.min
+    relax_binary_op = relax.op.minimum
 
 
 class Max(MultiInputBase):
     """Converts an onnx Max node into an equivalent Relax expression."""
 
-    numpy_op = _np.max
-    relax_op = relax.op.max
+    relax_binary_op = relax.op.maximum
 
 
-class Mean(MultiInputBase):
+class Mean(OnnxOpConverter):
     """Converts an onnx Mean node into an equivalent Relax expression."""
 
-    numpy_op = _np.mean
-    relax_op = relax.op.mean
+    @classmethod
+    def _impl_v1(cls, bb, inputs, attr, params):
+        total = inputs[0]
+        for operand in inputs[1:]:
+            total = bb.normalize(relax.op.add(total, operand))
+        count = relax.const(len(inputs), total.struct_info.dtype)
+        return bb.normalize(relax.op.divide(total, count))
 
 
 class Sum(MultiInputBase):
     """Converts an onnx Sum node into an equivalent Relax expression."""
 
-    numpy_op = _np.sum
-    relax_op = relax.op.sum
+    relax_binary_op = relax.op.add
 
 
 class Log(OnnxOpConverter):
