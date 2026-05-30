@@ -661,7 +661,7 @@ if(GTEST_FOUND)
     # TVM library will not contain any LLVM definitions.
     unset(LLVM_SO)
     foreach(L IN LISTS LLVM_LIBS)
-      if(L MATCHES "libLLVM.*\.so")
+      if(L MATCHES "libLLVM.*\\.(so|dylib)")
         set(LLVM_SO TRUE)
         break()
       endif()
