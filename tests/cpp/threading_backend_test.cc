@@ -333,3 +333,93 @@ TEST(ThreadingBackend, AdaptiveThreadsCalibration) {
   tvm::runtime::SetAdaptiveConfigForTesting(/*enabled=*/false, 1, 80);
   tvm::runtime::ResetAdaptiveProfilesForTesting();
 }
+
+// Counterpart to AdaptiveThreadsCalibration: a deterministically compute-bound region
+// (each task does total/num_task real work) is ~num_workers x faster at FULL than MIN,
+// so the calibration must keep it at FULL. Guards the "don't strangle parallel work"
+// direction (the regression 0.9's duration-threshold heuristic caused).
+TEST(ThreadingBackend, AdaptiveThreadsPicksFullForComputeBound) {
+  const int max_concurrency = tvm::runtime::threading::MaxConcurrency();
+  if (max_concurrency < 2) {
+    GTEST_SKIP() << "Need at least 2 workers";
+  }
+  const uint64_t warmup = 8;
+
+  std::vector<int32_t> observed;
+  std::mutex mu;
+  auto heavy = [](int task_id, TVMParallelGroupEnv* penv, void* cdata) -> int {
+    // Real, splittable work: more workers => less per-worker work => faster wall clock.
+    const int64_t total = 2000000;
+    const int nt = penv->num_task < 1 ? 1 : penv->num_task;
+    const int64_t per = (total + nt - 1) / nt;
+    const int64_t begin = static_cast<int64_t>(task_id) * per;
+    const int64_t end = std::min<int64_t>(total, begin + per);
+    volatile double acc = 0.0;
+    for (int64_t i = begin; i < end; ++i) acc += static_cast<double>(i) * 1.000001;
+    (void)acc;
+    if (task_id == 0) {
+      auto* ctx = reinterpret_cast<std::pair<std::vector<int32_t>*, std::mutex*>*>(cdata);
+      std::lock_guard<std::mutex> lock(*ctx->second);
+      ctx->first->push_back(penv->num_task);
+    }
+    return 0;
+  };
+  std::pair<std::vector<int32_t>*, std::mutex*> ctx{&observed, &mu};
+
+  tvm::runtime::SetAdaptiveConfigForTesting(/*enabled=*/true, /*min_threads=*/1, warmup);
+  tvm::runtime::ResetAdaptiveProfilesForTesting();
+  observed.clear();
+  const int total = static_cast<int>(warmup) + 6;
+  for (int i = 0; i < total; ++i) {
+    TVMBackendParallelLaunch(heavy, &ctx, 0);
+  }
+  ASSERT_EQ(observed.size(), static_cast<size_t>(total));
+  const int32_t full_val = observed[0];
+  EXPECT_GT(full_val, 1) << "full sampling should use more than 1 thread";
+  for (int i = static_cast<int>(warmup); i < total; ++i) {
+    EXPECT_EQ(observed[i], full_val)
+        << "post-warmup call " << i << " should pick FULL for compute-bound work";
+  }
+
+  tvm::runtime::SetAdaptiveConfigForTesting(/*enabled=*/false, 1, 80);
+  tvm::runtime::ResetAdaptiveProfilesForTesting();
+}
+
+// Regression: a TVM_MIN_NUM_THREADS larger than the live ThreadLocal pool must be clamped
+// to the pool size, not passed through to ThreadPool::Launch (which ICHECK_LE-aborts on
+// num_task > num_workers). Without the clamp-to-NumThreads() fix this test aborts the binary.
+TEST(ThreadingBackend, AdaptiveThreadsClampsMinToPoolSize) {
+  const int max_concurrency = tvm::runtime::threading::MaxConcurrency();
+  if (max_concurrency < 2) {
+    GTEST_SKIP() << "Need at least 2 workers";
+  }
+  const uint64_t warmup = 6;
+  const int oversized_min = max_concurrency + 64;  // deliberately larger than the pool
+
+  std::vector<int32_t> observed;
+  std::mutex mu;
+  auto recorder = [](int task_id, TVMParallelGroupEnv* penv, void* cdata) -> int {
+    if (task_id == 0) {
+      auto* ctx = reinterpret_cast<std::pair<std::vector<int32_t>*, std::mutex*>*>(cdata);
+      std::lock_guard<std::mutex> lock(*ctx->second);
+      ctx->first->push_back(penv->num_task);
+    }
+    return 0;
+  };
+  std::pair<std::vector<int32_t>*, std::mutex*> ctx{&observed, &mu};
+
+  tvm::runtime::SetAdaptiveConfigForTesting(/*enabled=*/true, oversized_min, warmup);
+  tvm::runtime::ResetAdaptiveProfilesForTesting();
+  observed.clear();
+  for (int i = 0; i < static_cast<int>(warmup) + 2; ++i) {
+    TVMBackendParallelLaunch(recorder, &ctx, 0);  // would abort here if min not clamped
+  }
+  ASSERT_FALSE(observed.empty());
+  for (int32_t nt : observed) {
+    EXPECT_GE(nt, 1);
+    EXPECT_LE(nt, max_concurrency) << "min must be clamped to the live pool size, never exceed it";
+  }
+
+  tvm::runtime::SetAdaptiveConfigForTesting(/*enabled=*/false, 1, 80);
+  tvm::runtime::ResetAdaptiveProfilesForTesting();
+}

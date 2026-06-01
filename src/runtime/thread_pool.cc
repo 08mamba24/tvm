@@ -590,6 +590,13 @@ int TVMBackendParallelLaunch(FTVMParallelLambda flambda, void* cdata, int num_ta
       sampling = 2;
     } else {
       // Calibrated: pick min only if it actually measured faster than full.
+      // SCOPE: the decision is made once and kept for the process lifetime. This is
+      // correct for static-shape compiled TIR regions (the validated target: constant
+      // batch size, same loop extents every call). It is NOT designed for regions whose
+      // cost varies at runtime (dynamic shape, or a shared runtime-helper lambda reused
+      // across very different sizes): a region first seen small could stay pinned to MIN.
+      // We don't re-sample because (a) the deployment is static-bs and (b) the workload
+      // extent is not visible at this layer (it is inside the opaque `cdata` closure).
       num_task = (prof->ema_min > 0.0 && prof->ema_min < prof->ema_full) ? acfg.min_threads : 0;
       if (!prof->logged) {
         LOG(INFO) << "[ADAPTIVE] region=" << reinterpret_cast<void*>(flambda)
@@ -598,7 +605,13 @@ int TVMBackendParallelLaunch(FTVMParallelLambda flambda, void* cdata, int num_ta
         prof->logged = true;
       }
     }
-    if (num_task > num_workers) num_task = num_workers;
+    // Clamp to the LIVE ThreadLocal pool size -- this is what ThreadPool::Launch
+    // ICHECK_LE's against. Do NOT clamp to MaxConcurrency(): the two diverge when
+    // threading::Configure() shrank the pool (an explicit nthreads, or a future
+    // per-instance affinity slice), and a TVM_MIN_NUM_THREADS larger than the live
+    // pool would otherwise abort inside Launch.
+    int avail = tvm::runtime::threading::NumThreads();
+    if (avail >= 1 && num_task > avail) num_task = avail;
   }
 
   if (num_workers == 1) {
