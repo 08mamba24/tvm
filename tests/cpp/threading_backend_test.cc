@@ -386,18 +386,29 @@ TEST(ThreadingBackend, AdaptiveThreadsPicksFullForComputeBound) {
 }
 
 // Regression: a TVM_MIN_NUM_THREADS larger than the live ThreadLocal pool must be clamped
-// to the pool size, not passed through to ThreadPool::Launch (which ICHECK_LE-aborts on
-// num_task > num_workers). Without the clamp-to-NumThreads() fix this test aborts the binary.
-TEST(ThreadingBackend, AdaptiveThreadsClampsMinToPoolSize) {
+// to the pool's actual NumThreads(), not MaxConcurrency(), and not passed through to
+// ThreadPool::Launch (which ICHECK_LE-aborts on num_task > num_workers).
+//
+// To exercise the case the reviewer raised -- a live pool SMALLER than MaxConcurrency() --
+// we run on a dedicated thread and shrink that thread's ThreadLocal pool via
+// threading::Configure(..., nthreads<cpus.size(), full_cpu_list): this keeps MaxConcurrency()
+// large (== cpus.size()) while NumThreads() drops to `shrunk`. min_threads is set above the
+// shrunk pool, so a MaxConcurrency()-based clamp would still overshoot and abort; only the
+// NumThreads()-based clamp keeps num_task within the live pool. Using a separate thread keeps
+// the resized pool out of the main thread so other tests are unaffected.
+TEST(ThreadingBackend, AdaptiveThreadsClampsMinToLivePool) {
   const int max_concurrency = tvm::runtime::threading::MaxConcurrency();
-  if (max_concurrency < 2) {
-    GTEST_SKIP() << "Need at least 2 workers";
+  if (max_concurrency < 4) {
+    GTEST_SKIP() << "Need >=4 workers to meaningfully shrink the live pool below MaxConcurrency";
   }
   const uint64_t warmup = 6;
-  const int oversized_min = max_concurrency + 64;  // deliberately larger than the pool
+  const int shrunk = 2;                        // live pool size < MaxConcurrency()
+  const int oversized_min = max_concurrency;   // > shrunk live pool
 
   std::vector<int32_t> observed;
   std::mutex mu;
+  int32_t pool_live = 0;
+  int32_t maxconc_live = 0;
   auto recorder = [](int task_id, TVMParallelGroupEnv* penv, void* cdata) -> int {
     if (task_id == 0) {
       auto* ctx = reinterpret_cast<std::pair<std::vector<int32_t>*, std::mutex*>*>(cdata);
@@ -409,17 +420,31 @@ TEST(ThreadingBackend, AdaptiveThreadsClampsMinToPoolSize) {
   std::pair<std::vector<int32_t>*, std::mutex*> ctx{&observed, &mu};
 
   tvm::runtime::SetAdaptiveConfigForTesting(/*enabled=*/true, oversized_min, warmup);
-  tvm::runtime::ResetAdaptiveProfilesForTesting();
-  observed.clear();
-  for (int i = 0; i < static_cast<int>(warmup) + 2; ++i) {
-    TVMBackendParallelLaunch(recorder, &ctx, 0);  // would abort here if min not clamped
-  }
+
+  std::thread worker([&]() {
+    // full cpu list (size == MaxConcurrency) but override nthreads=shrunk => pool shrinks,
+    // MaxConcurrency stays large => NumThreads() < MaxConcurrency() (the divergence case).
+    std::vector<unsigned int> cpus;
+    for (int i = 0; i < max_concurrency; ++i) cpus.push_back(i);
+    tvm::runtime::threading::Configure(
+        tvm::runtime::threading::ThreadGroup::kSpecifyThreadShareAllCore, shrunk, cpus);
+    pool_live = tvm::runtime::threading::NumThreads();
+    maxconc_live = tvm::runtime::threading::MaxConcurrency();
+    tvm::runtime::ResetAdaptiveProfilesForTesting();
+    for (int i = 0; i < static_cast<int>(warmup) + 2; ++i) {
+      TVMBackendParallelLaunch(recorder, &ctx, 0);  // would abort if clamped to MaxConcurrency
+    }
+  });
+  worker.join();
+
+  EXPECT_EQ(pool_live, shrunk) << "live pool should be shrunk below MaxConcurrency for this test";
+  EXPECT_GT(maxconc_live, pool_live) << "test only meaningful when MaxConcurrency > live pool";
   ASSERT_FALSE(observed.empty());
   for (int32_t nt : observed) {
     EXPECT_GE(nt, 1);
-    EXPECT_LE(nt, max_concurrency) << "min must be clamped to the live pool size, never exceed it";
+    EXPECT_LE(nt, pool_live)
+        << "adaptive num_task must be clamped to the LIVE pool (NumThreads), not MaxConcurrency";
   }
 
   tvm::runtime::SetAdaptiveConfigForTesting(/*enabled=*/false, 1, 80);
-  tvm::runtime::ResetAdaptiveProfilesForTesting();
 }
