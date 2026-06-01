@@ -34,13 +34,16 @@
 #endif
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "../support/utils.h"
@@ -485,6 +488,64 @@ int32_t NumThreads() { return tvm::runtime::ThreadPool::ThreadLocal()->NumThread
 }  // namespace runtime
 }  // namespace tvm
 
+namespace tvm {
+namespace runtime {
+namespace {
+
+// ---------------------------------------------------------------------------
+// Warmup-based calibrated adaptive per-op thread count (TVM 0.22 CPU migration,
+// design section "Phase 2"). This is the UNIVERSAL hook: every CPU parallel
+// kernel funnels through TVMBackendParallelLaunch with num_task==0 regardless of
+// Relax VM exec_mode (bytecode RunInstrCall path AND compiled __vmtir__main /
+// tvm_call_cpacked path both reach here), so calibrating here covers both modes.
+// The Relax VM func_pool_ wrapper does NOT cover compiled mode, because compiled
+// kernels are invoked via tvm_call_cpacked (direct symbol), bypassing func_pool_.
+//
+// Default-off: when TVM_ADAPTIVE_THREADS is unset/0 the whole feature compiles
+// down to a single cached bool check and the launch path is byte-for-byte
+// upstream behavior.
+struct AdaptiveConfig {
+  bool enabled = false;
+  int min_threads = 1;       // TVM_MIN_NUM_THREADS: the "few threads" candidate
+  uint64_t warmup = 80;      // TVM_WARMUP_TIMES: calls sampled before deciding
+  AdaptiveConfig() {
+    const char* e = std::getenv("TVM_ADAPTIVE_THREADS");
+    enabled = (e != nullptr && std::atoi(e) == 1);
+    const char* m = std::getenv("TVM_MIN_NUM_THREADS");
+    if (m != nullptr) min_threads = std::atoi(m);
+    if (min_threads < 1) min_threads = 1;
+    const char* w = std::getenv("TVM_WARMUP_TIMES");
+    if (w != nullptr) warmup = std::strtoull(w, nullptr, 10);
+    if (warmup < 2) warmup = 2;
+  }
+};
+
+// Read env once per process; deployment-wide and stable.
+const AdaptiveConfig& GetAdaptiveConfig() {
+  static const AdaptiveConfig cfg;
+  return cfg;
+}
+
+// One profile per distinct parallel region. The region is keyed by the compiled
+// parallel-lambda function pointer (flambda), which is stable per region for the
+// process lifetime. EMA of measured launch latency at full vs min threads.
+struct ParallelRegionProfile {
+  uint64_t calls = 0;
+  double ema_full = 0.0;
+  double ema_min = 0.0;
+  bool logged = false;
+};
+
+// thread_local: in the Triton TVM backend each model instance runs on a dedicated
+// thread and TVMBackendParallelLaunch is called from that instance thread (worker
+// threads execute flambda but never re-enter here). So a thread_local map is
+// naturally per-instance and lock-free.
+thread_local std::unordered_map<uintptr_t, ParallelRegionProfile> g_region_profiles;
+
+}  // namespace
+}  // namespace runtime
+}  // namespace tvm
+
 int TVMBackendParallelLaunch(FTVMParallelLambda flambda, void* cdata, int num_task) {
   int num_workers = tvm::runtime::threading::MaxConcurrency();
   // Per-op thread-local override (TVM 0.22 CPU runtime migration design 6.1):
@@ -495,6 +556,35 @@ int TVMBackendParallelLaunch(FTVMParallelLambda flambda, void* cdata, int num_ta
   if (override_num_task > 0 && num_task == 0) {
     num_task = std::min(override_num_task, num_workers);
   }
+
+  // Calibrated adaptive per-region thread selection. Only engages when the caller
+  // left num_task unspecified (==0, the codegen convention) and no manual override
+  // is active, so explicit/overridden callers keep precedence. num_workers==1 has
+  // nothing to tune.
+  const auto& acfg = tvm::runtime::GetAdaptiveConfig();
+  int sampling = 0;  // 0 = apply decision, 1 = sampling full, 2 = sampling min
+  tvm::runtime::ParallelRegionProfile* prof = nullptr;
+  if (acfg.enabled && num_task == 0 && num_workers > 1) {
+    prof = &tvm::runtime::g_region_profiles[reinterpret_cast<uintptr_t>(flambda)];
+    if (prof->calls < acfg.warmup / 2) {
+      num_task = 0;  // warmup phase 1: sample at full threads (resolved to all)
+      sampling = 1;
+    } else if (prof->calls < acfg.warmup) {
+      num_task = acfg.min_threads;  // warmup phase 2: sample at min threads
+      sampling = 2;
+    } else {
+      // Calibrated: pick min only if it actually measured faster than full.
+      num_task = (prof->ema_min > 0.0 && prof->ema_min < prof->ema_full) ? acfg.min_threads : 0;
+      if (!prof->logged) {
+        LOG(INFO) << "[ADAPTIVE] region=" << reinterpret_cast<void*>(flambda)
+                  << " full_us=" << prof->ema_full << " min_us=" << prof->ema_min
+                  << (num_task == 0 ? " => FULL" : " => MIN");
+        prof->logged = true;
+      }
+    }
+    if (num_task > num_workers) num_task = num_workers;
+  }
+
   if (num_workers == 1) {
     std::atomic<int32_t> sync_counter{0};
     TVMParallelGroupEnv env;
@@ -504,6 +594,19 @@ int TVMBackendParallelLaunch(FTVMParallelLambda flambda, void* cdata, int num_ta
     return 0;
   } else {
 #if !TVM_THREADPOOL_USE_OPENMP
+    if (sampling != 0) {
+      auto t0 = std::chrono::steady_clock::now();
+      int res = tvm::runtime::ThreadPool::ThreadLocal()->Launch(flambda, cdata, num_task, 1);
+      double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0)
+                      .count();
+      if (sampling == 1) {
+        prof->ema_full = (prof->ema_full == 0.0) ? us : 0.5 * prof->ema_full + 0.5 * us;
+      } else {
+        prof->ema_min = (prof->ema_min == 0.0) ? us : 0.5 * prof->ema_min + 0.5 * us;
+      }
+      prof->calls++;
+      return res;
+    }
     int res = tvm::runtime::ThreadPool::ThreadLocal()->Launch(flambda, cdata, num_task, 1);
     return res;
 #else
