@@ -542,6 +542,10 @@ thread_local std::unordered_map<uintptr_t, ParallelRegionProfile> g_region_profi
 // toggled per-test (it caches), and the profile map is thread_local. These let the C++
 // unit test (tests/cpp/threading_backend_test.cc) drive the calibration deterministically.
 // Not declared in any public header; not for production use.
+// TODO(merge-gate): for the production release build these should be guarded behind a
+// TVM_ENABLE_TESTING build flag (libtvm built without it for release, with it for the
+// test build) so they don't land in the shipped ABI. Left exported here because this
+// experimental build links cpptest directly against libtvm, which needs the symbols.
 TVM_DLL void SetAdaptiveConfigForTesting(bool enabled, int min_threads, uint64_t warmup) {
   AdaptiveConfig& cfg = MutableAdaptiveConfig();
   cfg.enabled = enabled;
@@ -584,12 +588,18 @@ int TVMBackendParallelLaunch(FTVMParallelLambda flambda, void* cdata, int num_ta
   tvm::runtime::ParallelRegionProfile* prof = nullptr;
   if (acfg.enabled && num_task == 0 && num_workers > 1) {
     prof = &tvm::runtime::g_region_profiles[reinterpret_cast<uintptr_t>(flambda)];
-    if (prof->calls < acfg.warmup / 2) {
-      num_task = 0;  // warmup phase 1: sample at full threads (resolved to all)
-      sampling = 1;
-    } else if (prof->calls < acfg.warmup) {
-      num_task = acfg.min_threads;  // warmup phase 2: sample at min threads
-      sampling = 2;
+    if (prof->calls < acfg.warmup) {
+      // Interleave FULL/MIN across the warmup window (even call -> FULL, odd -> MIN) so
+      // neither candidate is systematically measured colder than the other. A block
+      // "first-half FULL, second-half MIN" would sample MIN in the warmer second half and
+      // bias the decision toward MIN.
+      if ((prof->calls & 1) == 0) {
+        num_task = 0;                 // sample at full threads (resolved to all)
+        sampling = 1;
+      } else {
+        num_task = acfg.min_threads;  // sample at min threads
+        sampling = 2;
+      }
     } else {
       // Calibrated: pick min only if it actually measured faster than full.
       // SCOPE: the decision is made once and kept for the process lifetime. This is

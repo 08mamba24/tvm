@@ -289,15 +289,15 @@ TEST(ThreadingBackend, AdaptiveThreadsCalibration) {
   }
   ASSERT_EQ(observed.size(), static_cast<size_t>(total));
 
-  // warmup phase 1 (first half): sampled at FULL threads (the pool's worker count, > min).
-  const int32_t full_val = observed[0];
+  // warmup: FULL/MIN are interleaved (even call -> FULL = pool worker count, odd -> MIN).
+  const int32_t full_val = observed[0];  // call 0 is even -> FULL
   EXPECT_GT(full_val, min_threads) << "full sampling should use more than min threads";
-  for (uint64_t i = 0; i < warmup / 2; ++i) {
-    EXPECT_EQ(observed[i], full_val) << "warmup phase 1 call " << i << " should sample at full";
-  }
-  // warmup phase 2 (second half): sampled at MIN threads.
-  for (uint64_t i = warmup / 2; i < warmup; ++i) {
-    EXPECT_EQ(observed[i], min_threads) << "warmup phase 2 call " << i << " should sample at min";
+  for (uint64_t i = 0; i < warmup; ++i) {
+    if ((i & 1) == 0) {
+      EXPECT_EQ(observed[i], full_val) << "warmup even call " << i << " should sample at full";
+    } else {
+      EXPECT_EQ(observed[i], min_threads) << "warmup odd call " << i << " should sample at min";
+    }
   }
   // post-warmup: stable calibrated decision; empty work is dispatch-bound => MIN.
   for (int i = static_cast<int>(warmup); i < total; ++i) {
