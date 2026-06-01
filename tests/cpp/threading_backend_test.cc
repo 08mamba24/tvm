@@ -245,3 +245,91 @@ TEST(ThreadingBackend, ThreadLocalNumTaskOverride) {
   }
   tvm::runtime::threading::ClearPerOpNumThreads();
 }
+
+// Phase 2: calibrated adaptive per-op thread count.
+// The adaptive logic lives in TVMBackendParallelLaunch (thread_pool.cc), keyed by the
+// parallel-lambda pointer. These test-only hooks (defined in thread_pool.cc) let us drive
+// the calibration deterministically instead of via the process-cached env vars.
+namespace tvm {
+namespace runtime {
+TVM_DLL void SetAdaptiveConfigForTesting(bool enabled, int min_threads, uint64_t warmup);
+TVM_DLL void ResetAdaptiveProfilesForTesting();
+}  // namespace runtime
+}  // namespace tvm
+
+TEST(ThreadingBackend, AdaptiveThreadsCalibration) {
+  const int max_concurrency = tvm::runtime::threading::MaxConcurrency();
+  if (max_concurrency < 2) {
+    GTEST_SKIP() << "Need at least 2 workers for adaptive calibration";
+  }
+  const int min_threads = 1;
+  const uint64_t warmup = 20;
+
+  // Record the num_task each launch actually runs at: one entry per launch (task_id==0).
+  std::vector<int32_t> observed;
+  std::mutex mu;
+  auto recorder = [](int task_id, TVMParallelGroupEnv* penv, void* cdata) -> int {
+    if (task_id == 0) {
+      auto* ctx = reinterpret_cast<std::pair<std::vector<int32_t>*, std::mutex*>*>(cdata);
+      std::lock_guard<std::mutex> lock(*ctx->second);
+      ctx->first->push_back(penv->num_task);
+    }
+    return 0;  // empty work => dispatch/sync overhead dominates => MIN should win the calibration
+  };
+  std::pair<std::vector<int32_t>*, std::mutex*> ctx{&observed, &mu};
+
+  // ---- adaptive ON: warmup state machine + calibrated decision ----
+  tvm::runtime::SetAdaptiveConfigForTesting(/*enabled=*/true, min_threads, warmup);
+  tvm::runtime::ResetAdaptiveProfilesForTesting();
+  observed.clear();
+  const int total = static_cast<int>(warmup) + 10;
+  for (int i = 0; i < total; ++i) {
+    TVMBackendParallelLaunch(recorder, &ctx, 0);
+  }
+  ASSERT_EQ(observed.size(), static_cast<size_t>(total));
+
+  // warmup phase 1 (first half): sampled at FULL threads (the pool's worker count, > min).
+  const int32_t full_val = observed[0];
+  EXPECT_GT(full_val, min_threads) << "full sampling should use more than min threads";
+  for (uint64_t i = 0; i < warmup / 2; ++i) {
+    EXPECT_EQ(observed[i], full_val) << "warmup phase 1 call " << i << " should sample at full";
+  }
+  // warmup phase 2 (second half): sampled at MIN threads.
+  for (uint64_t i = warmup / 2; i < warmup; ++i) {
+    EXPECT_EQ(observed[i], min_threads) << "warmup phase 2 call " << i << " should sample at min";
+  }
+  // post-warmup: stable calibrated decision; empty work is dispatch-bound => MIN.
+  for (int i = static_cast<int>(warmup); i < total; ++i) {
+    EXPECT_EQ(observed[i], min_threads)
+        << "post-warmup call " << i << " should pick MIN for empty (dispatch-bound) work";
+  }
+
+  // ---- adaptive OFF: upstream behavior, always full ----
+  tvm::runtime::SetAdaptiveConfigForTesting(/*enabled=*/false, min_threads, warmup);
+  tvm::runtime::ResetAdaptiveProfilesForTesting();
+  observed.clear();
+  for (int i = 0; i < 5; ++i) {
+    TVMBackendParallelLaunch(recorder, &ctx, 0);
+  }
+  for (int32_t nt : observed) {
+    EXPECT_EQ(nt, full_val) << "adaptive OFF must use full threads (upstream behavior)";
+  }
+
+  // ---- explicit num_task takes precedence over adaptive (only meaningful with room) ----
+  if (full_val >= 3) {
+    tvm::runtime::SetAdaptiveConfigForTesting(/*enabled=*/true, min_threads, warmup);
+    tvm::runtime::ResetAdaptiveProfilesForTesting();
+    observed.clear();
+    const int explicit_task = 2;  // distinct from both min(1) and full(>=3)
+    for (int i = 0; i < 5; ++i) {
+      TVMBackendParallelLaunch(recorder, &ctx, explicit_task);
+    }
+    for (int32_t nt : observed) {
+      EXPECT_EQ(nt, explicit_task) << "explicit num_task must be respected even when adaptive is on";
+    }
+  }
+
+  // restore default-off so other tests in this binary are unaffected.
+  tvm::runtime::SetAdaptiveConfigForTesting(/*enabled=*/false, 1, 80);
+  tvm::runtime::ResetAdaptiveProfilesForTesting();
+}

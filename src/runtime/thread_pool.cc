@@ -520,11 +520,14 @@ struct AdaptiveConfig {
   }
 };
 
-// Read env once per process; deployment-wide and stable.
-const AdaptiveConfig& GetAdaptiveConfig() {
-  static const AdaptiveConfig cfg;
+// Read env once per process; deployment-wide and stable. Mutable storage so tests can
+// drive the calibration deterministically (see SetAdaptiveConfigForTesting); production
+// only ever reads it after the one-time env-based construction.
+AdaptiveConfig& MutableAdaptiveConfig() {
+  static AdaptiveConfig cfg;
   return cfg;
 }
+const AdaptiveConfig& GetAdaptiveConfig() { return MutableAdaptiveConfig(); }
 
 // One profile per distinct parallel region. The region is keyed by the compiled
 // parallel-lambda function pointer (flambda), which is stable per region for the
@@ -543,6 +546,19 @@ struct ParallelRegionProfile {
 thread_local std::unordered_map<uintptr_t, ParallelRegionProfile> g_region_profiles;
 
 }  // namespace
+
+// Test-only hooks: the production config is read from env exactly once and cannot be
+// toggled per-test (it caches), and the profile map is thread_local. These let the C++
+// unit test (tests/cpp/threading_backend_test.cc) drive the calibration deterministically.
+// Not declared in any public header; not for production use.
+TVM_DLL void SetAdaptiveConfigForTesting(bool enabled, int min_threads, uint64_t warmup) {
+  AdaptiveConfig& cfg = MutableAdaptiveConfig();
+  cfg.enabled = enabled;
+  cfg.min_threads = (min_threads < 1) ? 1 : min_threads;
+  cfg.warmup = (warmup < 2) ? 2 : warmup;
+}
+TVM_DLL void ResetAdaptiveProfilesForTesting() { g_region_profiles.clear(); }
+
 }  // namespace runtime
 }  // namespace tvm
 
