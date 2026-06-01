@@ -272,7 +272,12 @@ class ThreadPool {
     Init();
   }
 
-  // Phase 1 step 3: explicit thread count constructor for ONE_POOL instance pools
+  // Phase 1 step 3: explicit thread count constructor for ONE_POOL instance pools.
+  // NOTE (2026-06-01): ONE_POOL was rolled back (uniform-k private pool == global
+  // TVM_NUM_THREADS, no win for same-model multi-instance), so this ctor currently has
+  // NO caller (verified: no `new ThreadPool(n)` / `ThreadPool x(n)` site in src/ or
+  // tests/). Kept for now — harmless, and useful if ONE_POOL is ever revived. Safe to
+  // delete if not. Left in deliberately rather than silently dropped.
   explicit ThreadPool(int num_workers) : num_workers_(num_workers) {
     const char* exclude_worker0 = getenv("TVM_EXCLUDE_WORKER0");
     if (exclude_worker0 && atoi(exclude_worker0) == 0) {
