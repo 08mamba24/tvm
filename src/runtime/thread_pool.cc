@@ -572,10 +572,15 @@ int TVMBackendParallelLaunch(FTVMParallelLambda flambda, void* cdata, int num_ta
   // Per-op thread-local override (TVM 0.22 CPU runtime migration design 6.1):
   // only override when the caller did not request an explicit task count
   // (num_task == 0), so existing callers with a fixed num_task are untouched.
-  // The override is clamped to [1, num_workers].
+  // Clamp to the LIVE pool's NumThreads(), NOT MaxConcurrency(): the two diverge when
+  // threading::Configure() shrank the pool (explicit nthreads, or Phase 3 affinity), and
+  // an override larger than the live pool would otherwise abort in ThreadPool::Launch
+  // (ICHECK_LE). Same fix as the adaptive path below.
   int override_num_task = tvm::runtime::threading::GetPerOpNumThreads();
   if (override_num_task > 0 && num_task == 0) {
-    num_task = std::min(override_num_task, num_workers);
+    int avail = tvm::runtime::threading::NumThreads();
+    int cap = avail >= 1 ? avail : num_workers;
+    num_task = std::min(override_num_task, cap);
   }
 
   // Calibrated adaptive per-region thread selection. Only engages when the caller

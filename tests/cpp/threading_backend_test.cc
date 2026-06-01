@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
@@ -447,4 +448,56 @@ TEST(ThreadingBackend, AdaptiveThreadsClampsMinToLivePool) {
   }
 
   tvm::runtime::SetAdaptiveConfigForTesting(/*enabled=*/false, 1, 80);
+}
+
+// Regression (review item A): the Phase 1 manual override (SetPerOpNumThreads) must also be
+// clamped to the LIVE pool's NumThreads(), not MaxConcurrency(). Same divergence setup as
+// AdaptiveThreadsClampsMinToLivePool, but exercises the override path (adaptive OFF) instead
+// of the adaptive path. Without the fix, override > shrunk pool aborts in ThreadPool::Launch.
+TEST(ThreadingBackend, PerOpOverrideClampsToLivePool) {
+  const int max_concurrency = tvm::runtime::threading::MaxConcurrency();
+  if (max_concurrency < 4) {
+    GTEST_SKIP() << "Need >=4 workers to shrink the live pool below MaxConcurrency";
+  }
+  tvm::runtime::SetAdaptiveConfigForTesting(/*enabled=*/false, 1, 80);  // ensure only override path runs
+  const int shrunk = 2;
+  const int oversized_override = max_concurrency;  // > shrunk live pool
+
+  std::vector<int32_t> observed;
+  std::mutex mu;
+  int32_t pool_live = 0;
+  int32_t maxconc_live = 0;
+  auto recorder = [](int task_id, TVMParallelGroupEnv* penv, void* cdata) -> int {
+    if (task_id == 0) {
+      auto* ctx = reinterpret_cast<std::pair<std::vector<int32_t>*, std::mutex*>*>(cdata);
+      std::lock_guard<std::mutex> lock(*ctx->second);
+      ctx->first->push_back(penv->num_task);
+    }
+    return 0;
+  };
+  std::pair<std::vector<int32_t>*, std::mutex*> ctx{&observed, &mu};
+
+  std::thread worker([&]() {
+    std::vector<unsigned int> cpus;
+    for (int i = 0; i < max_concurrency; ++i) cpus.push_back(i);
+    tvm::runtime::threading::Configure(
+        tvm::runtime::threading::ThreadGroup::kSpecifyThreadShareAllCore, shrunk, cpus);
+    pool_live = tvm::runtime::threading::NumThreads();
+    maxconc_live = tvm::runtime::threading::MaxConcurrency();
+    tvm::runtime::threading::SetPerOpNumThreads(oversized_override);  // > live pool
+    for (int i = 0; i < 3; ++i) {
+      TVMBackendParallelLaunch(recorder, &ctx, 0);  // would abort if clamped to MaxConcurrency
+    }
+    tvm::runtime::threading::ClearPerOpNumThreads();
+  });
+  worker.join();
+
+  EXPECT_EQ(pool_live, shrunk);
+  EXPECT_GT(maxconc_live, pool_live) << "test only meaningful when MaxConcurrency > live pool";
+  ASSERT_FALSE(observed.empty());
+  for (int32_t nt : observed) {
+    EXPECT_GE(nt, 1);
+    EXPECT_LE(nt, pool_live)
+        << "per-op override must be clamped to the LIVE pool (NumThreads), not MaxConcurrency";
+  }
 }
