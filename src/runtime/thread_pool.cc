@@ -272,20 +272,6 @@ class ThreadPool {
     Init();
   }
 
-  // Phase 1 step 3: explicit thread count constructor for ONE_POOL instance pools.
-  // NOTE (2026-06-01): ONE_POOL was rolled back (uniform-k private pool == global
-  // TVM_NUM_THREADS, no win for same-model multi-instance), so this ctor currently has
-  // NO caller (verified: no `new ThreadPool(n)` / `ThreadPool x(n)` site in src/ or
-  // tests/). Kept for now — harmless, and useful if ONE_POOL is ever revived. Safe to
-  // delete if not. Left in deliberately rather than silently dropped.
-  explicit ThreadPool(int num_workers) : num_workers_(num_workers) {
-    const char* exclude_worker0 = getenv("TVM_EXCLUDE_WORKER0");
-    if (exclude_worker0 && atoi(exclude_worker0) == 0) {
-      exclude_worker0_ = false;
-    }
-    Init();
-  }
-
   ~ThreadPool() {
     for (std::unique_ptr<SpscTaskQueue>& q : queues_) {
       q->SignalForKill();
@@ -587,6 +573,12 @@ int TVMBackendParallelLaunch(FTVMParallelLambda flambda, void* cdata, int num_ta
   // left num_task unspecified (==0, the codegen convention) and no manual override
   // is active, so explicit/overridden callers keep precedence. num_workers==1 has
   // nothing to tune.
+  //
+  // Gated to the native pthread pool: the calibration is a timing/EMA state machine
+  // driven by the ThreadPool::Launch sampling below, which the OpenMP launch path does
+  // NOT run. Under an OpenMP build (TVM_THREADPOOL_USE_OPENMP=1) adaptive is simply
+  // absent — the launch falls through to plain full-thread OpenMP (= upstream behavior).
+#if !TVM_THREADPOOL_USE_OPENMP
   const auto& acfg = tvm::runtime::GetAdaptiveConfig();
   int sampling = 0;  // 0 = apply decision, 1 = sampling full, 2 = sampling min
   tvm::runtime::ParallelRegionProfile* prof = nullptr;
@@ -623,6 +615,7 @@ int TVMBackendParallelLaunch(FTVMParallelLambda flambda, void* cdata, int num_ta
     int avail = tvm::runtime::threading::NumThreads();
     if (avail >= 1 && num_task > avail) num_task = avail;
   }
+#endif  // !TVM_THREADPOOL_USE_OPENMP
 
   if (num_workers == 1) {
     std::atomic<int32_t> sync_counter{0};
