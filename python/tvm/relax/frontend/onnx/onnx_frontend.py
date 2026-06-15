@@ -1739,7 +1739,14 @@ class Split(OnnxOpConverter):
 
     @classmethod
     def _impl_v13(cls, bb, inputs, attr, params):
-        splits = inputs[1]
+        # `split` is the 2nd input in opset>=13. When the model carries it as an
+        # initializer and from_onnx(keep_params_in_input=True) is used (the
+        # detach_params / cpu_weight_prepack path), the initializer arrives as a
+        # relax.Var. Resolve it back to its constant value via get_constant -- the
+        # same pattern Slice/Reshape/etc. use -- so a statically-known split is not
+        # misclassified as dynamic. A genuinely dynamic split (not in params) is
+        # returned unchanged and still rejected below.
+        splits = get_constant(inputs[1], params)
         splits_rank = None
         if splits is not None:
             splits_rank = splits.struct_info.ndim
