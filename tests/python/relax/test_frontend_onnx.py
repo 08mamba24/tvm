@@ -27,7 +27,7 @@ import numpy as np
 import onnx
 import onnxruntime
 import pytest
-from onnx import ModelProto, TensorProto, helper
+from onnx import ModelProto, TensorProto, helper, numpy_helper
 
 import tvm
 import tvm.testing
@@ -2519,6 +2519,32 @@ def test_split(fp_arith, dynamic):
     # Test that the default case modifies nothing when split list has length one
     verify_split((1, 2), [[2]], [2], axis=1)
     verify_split((1, 2), [[2]], [1])
+
+
+def test_split_v13_split_from_initializer():
+    """Opset>=13 Split whose `split` lengths come from a graph *initializer*.
+
+    With keep_params_in_input=True (the prepack/detach_params path), initializers
+    are imported as relax.Var, so Split._impl_v13 must resolve the static value via
+    get_constant() rather than rejecting the Var as a dynamic split. Regression for
+    "Dynamic Split not yet supported". The existing test_split only feeds `split`
+    through a Constant node (already relax.Constant) and never exercised this path.
+    """
+    split = np.array([2, 2], dtype=np.int64)
+    split_init = numpy_helper.from_array(split, name="split")
+    node = helper.make_node("Split", inputs=["input", "split"], outputs=["o0", "o1"], axis=1)
+    graph = helper.make_graph(
+        [node],
+        "split_init_test",
+        inputs=[helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 4])],
+        initializer=[split_init],
+        outputs=[
+            helper.make_tensor_value_info("o0", TensorProto.FLOAT, [1, 2]),
+            helper.make_tensor_value_info("o1", TensorProto.FLOAT, [1, 2]),
+        ],
+    )
+    model = helper.make_model(graph, producer_name="split_init_test")
+    check_correctness(model, opset=13)
 
 
 @pytest.mark.parametrize("dynamic", [True, False])
