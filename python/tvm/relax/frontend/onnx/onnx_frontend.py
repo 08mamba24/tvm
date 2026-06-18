@@ -171,6 +171,39 @@ def resolve_static_input_through_cast(
     return value
 
 
+def _get_known_tensor_rank(expr: relax.Expr) -> Optional[int]:
+    """Return the statically known rank of an expression when available.
+
+    Backport-adapted from upstream #19827: upstream reads ``expr.ty`` /
+    ``tvm.tirx``, which don't exist on the 0.22 base — use struct_info instead.
+    """
+    if isinstance(expr, relax.Constant):
+        return len(expr.data.numpy().shape)
+    if isinstance(expr, relax.ShapeExpr):
+        return 1
+    if isinstance(expr, tvm.tir.PrimExpr):
+        return 0
+    sinfo = getattr(expr, "struct_info", None)
+    if isinstance(sinfo, relax.TensorStructInfo):
+        return None if sinfo.ndim == -1 else int(sinfo.ndim)
+    return None
+
+
+def _normalize_constant_axes(axes: List[int], rank: int, op_name: str) -> List[int]:
+    """Normalize a list of constant axes and validate their uniqueness."""
+    normalized_axes = []
+    for axis in axes:
+        original_axis = axis
+        if axis < 0:
+            axis += rank
+        if axis < 0 or axis >= rank:
+            raise ValueError(f"{op_name} axis {original_axis} is out of range for rank {rank}.")
+        normalized_axes.append(axis)
+    if len(normalized_axes) != len(set(normalized_axes)):
+        raise ValueError(f"{op_name} axes must be unique.")
+    return normalized_axes
+
+
 def get_value(token, value_dict: Dict[str, tvm.tir.SizeVar]) -> Union[int, tvm.tir.SizeVar]:
     """Converts to token to an integer value if it a constant, otherwise it generates a SizeVar
 
@@ -1991,6 +2024,63 @@ class Pad(OnnxOpConverter):
         else:
             # TODO(gigiblender) Support edge mode.
             raise NotImplementedError("Pad mode {} not implemented".format(pad_mode))
+
+    @classmethod
+    def _impl_v19(cls, bb, inputs, attr, params):
+        pads = get_constant(inputs[1], params)
+        constant_value = get_constant(inputs[2], params)
+        if constant_value is not None:
+            constant_value = constant_value.data.numpy().item()
+        else:
+            constant_value = 0.0
+
+        if isinstance(pads, relax.Constant):
+            pad_before, pad_after = _np.split(pads.data.numpy(), 2)
+            pad_before = _np.ndarray.tolist(pad_before)
+            pad_after = _np.ndarray.tolist(pad_after)
+        else:
+            raise ValueError("Dynamic pads are not supported yet.")
+
+        axes_input = inputs[3] if len(inputs) > 3 else None
+        if axes_input is not None:
+            axes_const = get_constant(axes_input, params)
+            if not isinstance(axes_const, relax.Constant):
+                raise ValueError("Dynamic axes are not supported for Pad yet.")
+
+            axes = axes_const.data.numpy().tolist()
+            if len(pad_before) != len(axes):
+                raise ValueError(
+                    f"Pad expects pads length 2 * len(axes), got "
+                    f"{len(pad_before) + len(pad_after)} pads and {len(axes)} axes."
+                )
+
+            rank = _get_known_tensor_rank(inputs[0])
+            if rank is None:
+                raise ValueError("Pad with axes requires a statically known input rank.")
+
+            axes = _normalize_constant_axes([int(a) for a in axes], rank, "Pad")
+            full_before = [0] * rank
+            full_after = [0] * rank
+            for i, ax in enumerate(axes):
+                full_before[ax] = pad_before[i]
+                full_after[ax] = pad_after[i]
+            pad_before, pad_after = full_before, full_after
+
+        pad_mode = attr.get("mode", b"constant").decode("utf-8")
+        if pad_mode not in ["constant", "edge", "reflect", "wrap"]:
+            raise tvm.error.OpAttributeInvalid(
+                "Value " + pad_mode + ' in attribute "mode" is invalid for operator Pad.'
+            )
+
+        if pad_mode == "constant":
+            return bb.emit_te(topi.nn.pad, inputs[0], pad_before, pad_after, constant_value)
+        elif pad_mode == "reflect":
+            return bb.emit_te(topi.nn.mirror_pad, inputs[0], pad_before, pad_after, "REFLECT")
+        elif pad_mode == "wrap":
+            return bb.emit_te(topi.nn.circular_pad, inputs[0], pad_before, pad_after)
+        else:
+            # edge mode - replicate border values
+            return bb.emit_te(topi.nn.replicate_pad, inputs[0], pad_before, pad_after)
 
 
 class Tile(OnnxOpConverter):
