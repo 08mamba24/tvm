@@ -53,6 +53,35 @@ namespace tvm {
 namespace runtime {
 namespace {
 using support::IsNumber;
+
+// Route-1 FTZ/DAZ: flush subnormal floats to zero to dodge the 10-100x
+// subnormal-arithmetic latency penalty. Set once per thread (worker entry +
+// parallel-launch entry) so every compute thread runs flushed. Opt-in via
+// TVM_ENABLE_FTZ_DAZ; CHANGES NUMERICS (subnormal -> 0), so never default-on.
+// Scope: native pthread pool only (same as the adaptive-threads hook). Under an
+// OpenMP build the worker threads bypass RunWorker and are not covered here.
+inline void MaybeEnableFtzDaz() {
+  static thread_local bool done = false;
+  if (done) return;
+  done = true;
+  static const bool kEnable = []() {
+    const char* v = getenv("TVM_ENABLE_FTZ_DAZ");
+    return v != nullptr && atoi(v) != 0;
+  }();
+  if (!kEnable) return;
+#if defined(__x86_64__) || defined(_M_X64)
+  unsigned int mxcsr = __builtin_ia32_stmxcsr();
+  mxcsr |= 0x8040u;  // FTZ (bit15=0x8000) | DAZ (bit6=0x0040)
+  __builtin_ia32_ldmxcsr(mxcsr);
+#elif defined(__aarch64__)
+  uint64_t fpcr;
+  __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+  fpcr |= (1ULL << 24);  // FPCR.FZ: flush subnormal inputs and results
+  __asm__ volatile("msr fpcr, %0" : : "r"(fpcr));
+  __asm__ volatile("isb");  // sync so the new FPCR governs subsequent FP ops
+#endif
+}
+
 constexpr uint32_t kDefaultSpinCount = 300000;
 
 uint32_t GetSpinCount() {
@@ -354,6 +383,7 @@ class ThreadPool {
     SpscTaskQueue* queue = queues_[worker_id].get();
     SpscTaskQueue::Task task;
     ParallelLauncher::ThreadLocal()->is_worker = true;
+    MaybeEnableFtzDaz();  // FTZ/DAZ for this pool worker (one-shot, env-gated)
     // Initialize the spin count (from envvar TVM_THREAD_POOL_SPIN_COUNT) on
     // the global first use of the ThreadPool.
     // TODO(tulloch): should we make this configurable via standard APIs?
@@ -558,6 +588,7 @@ TVM_DLL void ResetAdaptiveProfilesForTesting() { g_region_profiles.clear(); }
 }  // namespace tvm
 
 int TVMBackendParallelLaunch(FTVMParallelLambda flambda, void* cdata, int num_task) {
+  tvm::runtime::MaybeEnableFtzDaz();  // FTZ/DAZ for the launching thread (runs task 0)
   int num_workers = tvm::runtime::threading::MaxConcurrency();
   // Per-op thread-local override (TVM 0.22 CPU runtime migration design 6.1):
   // only override when the caller did not request an explicit task count
