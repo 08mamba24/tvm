@@ -106,6 +106,70 @@ def get_constant(
         return var
 
 
+def resolve_static_input_through_cast(
+    value,
+    params: List[Dict[str, relax.Var]],
+):
+    """Resolve a Relax value to a Constant, transparently piercing astype/cast calls.
+
+    Some ONNX ops (e.g. Split-v13) take their secondary input (split sizes,
+    axes, ...) as an initializer. When the frontend is invoked with
+    ``keep_params_in_input=True``, initializers stay as ``relax.Var``s, and
+    upstream dtype normalisation may wrap them in one or more ``relax.astype``
+    calls. ``get_constant`` only handles the bare-Var case, so those wrapped
+    initializers get mis-classified as dynamic.
+
+    This helper walks through any chain of ``relax.astype`` calls, resolves the
+    underlying ``relax.Var`` against ``params``, and folds the cast(s) on the
+    numpy side so that the caller sees a static ``relax.Constant``.
+
+    Parameters
+    ----------
+    value:
+        A relax expression. Typically ``relax.Constant``, ``relax.Var``, or a
+        ``relax.Call`` of ``relax.astype``.
+    params:
+        The (graph_nodes, params) registry used elsewhere in the frontend, as
+        accepted by :func:`get_constant`.
+
+    Returns
+    -------
+    A ``relax.Constant`` when the value can be resolved statically; otherwise
+    the input value unchanged (truly dynamic, or a non-cast Call).
+    """
+    # Already a Constant -> nothing to do.
+    if isinstance(value, relax.Constant):
+        return value
+
+    # Bare Var: delegate to get_constant, which will fold it to a Constant if
+    # it's a known param, or hand it back unchanged if it's truly dynamic.
+    if isinstance(value, relax.Var):
+        return get_constant(value, params)
+
+    # astype call: recurse, and if the inner value resolves to a Constant, fold
+    # the cast on the numpy side so the caller still sees a static value.
+    if isinstance(value, relax.Call):
+        op_name = getattr(value.op, "name", None)
+        if op_name in ("relax.astype", "relax.cast"):
+            inner = resolve_static_input_through_cast(value.args[0], params)
+            if isinstance(inner, relax.Constant):
+                attrs = value.attrs
+                if attrs is not None and hasattr(attrs, "dtype"):
+                    dtype = attrs.dtype
+                else:
+                    try:
+                        dtype = attrs["dtype"]  # type: ignore[index]
+                    except Exception:  # pylint: disable=broad-except
+                        dtype = inner.data.dtype
+                arr = inner.data.numpy().astype(str(dtype))
+                return relax.const(arr, str(dtype))
+            return value
+        return value
+
+    # Anything else: leave alone.
+    return value
+
+
 def get_value(token, value_dict: Dict[str, tvm.tir.SizeVar]) -> Union[int, tvm.tir.SizeVar]:
     """Converts to token to an integer value if it a constant, otherwise it generates a SizeVar
 
@@ -662,7 +726,7 @@ class Unsqueeze(OnnxOpConverter):
     @classmethod
     def _impl_v13(cls, bb, inputs, attr, params):
         data = inputs[0]
-        axes = get_constant(inputs[1], params)
+        axes = resolve_static_input_through_cast(inputs[1], params)
 
         # Handle ONNX shape inference
         if isinstance(data, relax.PrimValue) and isinstance(axes, relax.Constant):
@@ -943,7 +1007,7 @@ class Reshape(OnnxOpConverter):
     @classmethod
     def _impl_v13(cls, bb, inputs, attr, params):
         data = inputs[0]
-        new_shape = get_constant(inputs[1], params)
+        new_shape = resolve_static_input_through_cast(inputs[1], params)
 
         if isinstance(data, relax.ShapeExpr) and isinstance(new_shape, relax.Constant):
             new_shape = new_shape.data.numpy().tolist()
@@ -1032,7 +1096,7 @@ class Trilu(OnnxOpConverter):
         k = inputs[1] if len(inputs) > 1 else 0
 
         if len(inputs) > 1:
-            k = get_constant(inputs[1], params)
+            k = resolve_static_input_through_cast(inputs[1], params)
             if isinstance(k, relax.Constant):
                 k = int(k.data.numpy().item())
             else:
@@ -1336,7 +1400,7 @@ class CumSum(OnnxOpConverter):
     @classmethod
     def _impl_v14(cls, bb, inputs, attr, params):
         data = inputs[0]
-        axis = get_constant(inputs[1], params)
+        axis = resolve_static_input_through_cast(inputs[1], params)
         assert not attr.get("exclusive", False), "Exclusive option not yet supported."
 
         if isinstance(axis, relax.Constant):
@@ -1362,7 +1426,7 @@ class Squeeze(OnnxOpConverter):
     @classmethod
     def _impl_v13(cls, bb, inputs, attr, params):
         data = inputs[0]
-        axis = get_constant(inputs[1], params)
+        axis = resolve_static_input_through_cast(inputs[1], params)
         if isinstance(axis, relax.Constant):
             axis = tuple([int(x) for x in axis.data.numpy()])
 
@@ -1742,11 +1806,13 @@ class Split(OnnxOpConverter):
         # `split` is the 2nd input in opset>=13. When the model carries it as an
         # initializer and from_onnx(keep_params_in_input=True) is used (the
         # detach_params / cpu_weight_prepack path), the initializer arrives as a
-        # relax.Var. Resolve it back to its constant value via get_constant -- the
-        # same pattern Slice/Reshape/etc. use -- so a statically-known split is not
-        # misclassified as dynamic. A genuinely dynamic split (not in params) is
-        # returned unchanged and still rejected below.
-        splits = get_constant(inputs[1], params)
+        # relax.Var, possibly wrapped in one or more astype/cast calls inserted
+        # by upstream dtype normalisation. resolve_static_input_through_cast
+        # pierces those casts and folds the Var back to a Constant so a
+        # statically-known split is not misclassified as dynamic. A genuinely
+        # dynamic split (not in params) is returned unchanged and still rejected
+        # below.
+        splits = resolve_static_input_through_cast(inputs[1], params)
         splits_rank = None
         if splits is not None:
             splits_rank = splits.struct_info.ndim
@@ -1783,10 +1849,10 @@ class Slice(OnnxOpConverter):
     def _impl_v13(cls, bb, inputs, attr, params):
         # TODO (jwfromm) currently only supports constant parameters.
         data = inputs[0]
-        starts = get_constant(inputs[1], params)
-        ends = get_constant(inputs[2], params)
-        axes = get_constant(inputs[3], params)
-        steps = get_constant(inputs[4], params)
+        starts = resolve_static_input_through_cast(inputs[1], params)
+        ends = resolve_static_input_through_cast(inputs[2], params)
+        axes = resolve_static_input_through_cast(inputs[3], params)
+        steps = resolve_static_input_through_cast(inputs[4], params)
         if not all(
             [
                 (
@@ -1874,8 +1940,8 @@ class Pad(OnnxOpConverter):
 
     @classmethod
     def _impl_v11(cls, bb, inputs, attr, params):
-        pads = get_constant(inputs[1], params)
-        constant_value = get_constant(inputs[2], params)
+        pads = resolve_static_input_through_cast(inputs[1], params)
+        constant_value = resolve_static_input_through_cast(inputs[2], params)
         if constant_value is not None:
             constant_value = constant_value.data.numpy().item()
         else:
@@ -1908,7 +1974,7 @@ class Tile(OnnxOpConverter):
 
     @classmethod
     def _impl_v13(cls, bb, inputs, attr, params):
-        reps = get_constant(inputs[1], params)
+        reps = resolve_static_input_through_cast(inputs[1], params)
         if isinstance(reps, relax.Constant):
             reps = reps.data.numpy().tolist()
         else:
@@ -2202,9 +2268,9 @@ class Resize(OnnxOpConverter):
 
         # Unpack inputs.
         x = inputs[0]
-        roi = get_constant(inputs[1], params)
-        scales = get_constant(inputs[2], params)
-        sizes = get_constant(inputs[3], params)
+        roi = resolve_static_input_through_cast(inputs[1], params)
+        scales = resolve_static_input_through_cast(inputs[2], params)
+        sizes = resolve_static_input_through_cast(inputs[3], params)
         ndims = len(x.struct_info.shape)
         assert ndims == 4, "Only resize2d is currently supported."
 
@@ -2278,9 +2344,9 @@ class Range(OnnxOpConverter):
 
     @classmethod
     def _impl_v12(cls, bb, inputs, attr, params):
-        start = get_constant(inputs[0], params)
-        limit = get_constant(inputs[1], params)
-        delta = get_constant(inputs[2], params)
+        start = resolve_static_input_through_cast(inputs[0], params)
+        limit = resolve_static_input_through_cast(inputs[1], params)
+        delta = resolve_static_input_through_cast(inputs[2], params)
         out_dtype = start.struct_info.dtype
 
         if isinstance(start, relax.Constant):
@@ -2634,7 +2700,7 @@ class ReduceMax(OnnxOpConverter):
         # Optional axes input
         axes = None
         if len(inputs) > 1 and inputs[1] is not None:
-            axes_const = get_constant(inputs[1], params)
+            axes_const = resolve_static_input_through_cast(inputs[1], params)
             assert isinstance(axes_const, relax.Constant), "Only constant axes currently supported"
             axes = axes_const.data.numpy().tolist()
 
@@ -2668,7 +2734,7 @@ class ReduceMin(OnnxOpConverter):
         # Optional axes input
         axes = None
         if len(inputs) > 1 and inputs[1] is not None:
-            axes_const = get_constant(inputs[1], params)
+            axes_const = resolve_static_input_through_cast(inputs[1], params)
             assert isinstance(axes_const, relax.Constant), "Only constant axes currently supported"
             axes = axes_const.data.numpy().tolist()
 
@@ -2702,7 +2768,7 @@ class ReduceSum(OnnxOpConverter):
         # Optional axes input
         axes = None
         if len(inputs) > 1 and inputs[1] is not None:
-            axes_const = get_constant(inputs[1], params)
+            axes_const = resolve_static_input_through_cast(inputs[1], params)
             assert isinstance(axes_const, relax.Constant), "Only constant axes currently supported"
             axes = axes_const.data.numpy().tolist()
 
@@ -2736,7 +2802,7 @@ class ReduceMean(OnnxOpConverter):
         # Optional axes input
         axes = None
         if len(inputs) > 1 and inputs[1] is not None:
-            axes_const = get_constant(inputs[1], params)
+            axes_const = resolve_static_input_through_cast(inputs[1], params)
             assert isinstance(axes_const, relax.Constant), "Only constant axes currently supported"
             axes = axes_const.data.numpy().tolist()
 
@@ -2770,7 +2836,7 @@ class ReduceProd(OnnxOpConverter):
         # Optional axes input
         axes = None
         if len(inputs) > 1 and inputs[1] is not None:
-            axes_const = get_constant(inputs[1], params)
+            axes_const = resolve_static_input_through_cast(inputs[1], params)
             assert isinstance(axes_const, relax.Constant), "Only constant axes currently supported"
             axes = axes_const.data.numpy().tolist()
 
@@ -2810,7 +2876,7 @@ class ReduceLogSumExp(OnnxOpConverter):
         # Optional axes input (second input)
         axes = None
         if len(inputs) > 1 and inputs[1] is not None:
-            axes_const = get_constant(inputs[1], params)
+            axes_const = resolve_static_input_through_cast(inputs[1], params)
             assert isinstance(axes_const, relax.Constant), "Only constant axes currently supported"
             axes = axes_const.data.numpy().tolist()
 
@@ -2853,7 +2919,7 @@ class ReduceLogSum(OnnxOpConverter):
         # Optional axes input
         axes = None
         if len(inputs) > 1 and inputs[1] is not None:
-            axes_const = get_constant(inputs[1], params)
+            axes_const = resolve_static_input_through_cast(inputs[1], params)
             assert isinstance(axes_const, relax.Constant), "Only constant axes currently supported"
             axes = axes_const.data.numpy().tolist()
 
@@ -2887,7 +2953,7 @@ class ReduceSumSquare(OnnxOpConverter):
         # Optional axes input
         axes = None
         if len(inputs) > 1 and inputs[1] is not None:
-            axes_const = get_constant(inputs[1], params)
+            axes_const = resolve_static_input_through_cast(inputs[1], params)
             assert isinstance(axes_const, relax.Constant), "Only constant axes currently supported"
             axes = axes_const.data.numpy().tolist()
 
@@ -2921,7 +2987,7 @@ class ReduceL1(OnnxOpConverter):
         # Optional axes input
         axes = None
         if len(inputs) > 1 and inputs[1] is not None:
-            axes_const = get_constant(inputs[1], params)
+            axes_const = resolve_static_input_through_cast(inputs[1], params)
             assert isinstance(axes_const, relax.Constant), "Only constant axes currently supported"
             axes = axes_const.data.numpy().tolist()
 
@@ -2955,7 +3021,7 @@ class ReduceL2(OnnxOpConverter):
         # Optional axes input
         axes = None
         if len(inputs) > 1 and inputs[1] is not None:
-            axes_const = get_constant(inputs[1], params)
+            axes_const = resolve_static_input_through_cast(inputs[1], params)
             assert isinstance(axes_const, relax.Constant), "Only constant axes currently supported"
             axes = axes_const.data.numpy().tolist()
 
@@ -3150,8 +3216,8 @@ class OneHot(OnnxOpConverter):
     @classmethod
     def _impl_v11(cls, bb, inputs, attr, params):
         indices = inputs[0]
-        depth = get_constant(inputs[1], params)
-        values = get_constant(inputs[2], params)
+        depth = resolve_static_input_through_cast(inputs[1], params)
+        values = resolve_static_input_through_cast(inputs[2], params)
         axis = attr.get("axis", -1)
         assert isinstance(depth, relax.Constant), "Only constant depth currently supported."
         depth = depth.data.numpy().tolist()
@@ -4157,6 +4223,87 @@ class ONNXGraphImporter:
         return sym
 
 
+def _entry_level_constant_fold(
+    model: "onnx.onnx_ml_pb2.ModelProto",
+) -> "onnx.onnx_ml_pb2.ModelProto":
+    """Run an entry-level constant fold on an ONNX model.
+
+    The goal is to collapse pure-initializer subgraphs (e.g.
+    ``Cast(initializer)`` / ``Identity(initializer)`` /
+    ``Slice(initializer)``) into folded initializers *before* the relax
+    frontend normalizes the graph. This is critical when callers pass
+    ``keep_params_in_input=True``: initializers turn into function
+    parameters (not relax ``Constant`` nodes), so per-op converters can no
+    longer eagerly evaluate small initializer-only chains. Without this
+    pre-pass, patterns like ``Cast(int32 init)->Reshape`` blow up because
+    Reshape's normalizer wants a ``relax.Shape`` (not an ``R.astype``
+    call) for its second argument.
+
+    Strategy
+    --------
+    1. Prefer ``onnxsim.simplify`` (which does ONNX-level constant folding
+       and shape inference) if available.
+    2. Otherwise fall back to ``onnxoptimizer.optimize`` with a small set
+       of safe, semantic-preserving passes.
+    3. If neither library is available, or folding fails / mutates the
+       graph in an invalid way, warn and return the original model
+       unchanged. Constant folding is a semantics-preserving rewrite, so
+       this is always safe to skip.
+    """
+    # First-choice path: onnxsim. Does full constant folding via ORT.
+    try:
+        import onnxsim  # pylint: disable=import-outside-toplevel
+    except ImportError:
+        onnxsim = None  # type: ignore[assignment]
+
+    if onnxsim is not None:
+        try:
+            folded, check_ok = onnxsim.simplify(model, skip_shape_inference=False)
+        except Exception as exc:  # pylint: disable=broad-except
+            warnings.warn(
+                "Entry-level onnxsim.simplify() failed; continuing with the "
+                f"unfolded ONNX model. Reason: {exc!r}"
+            )
+            folded, check_ok = None, False
+
+        if folded is not None and check_ok:
+            return folded
+        if folded is not None and not check_ok:
+            warnings.warn(
+                "onnxsim.simplify() returned a model whose validator check "
+                "did not pass; keeping the unfolded model."
+            )
+
+    # Fallback path: onnxoptimizer with safe, semantic-preserving passes.
+    try:
+        import onnxoptimizer  # pylint: disable=import-outside-toplevel
+    except ImportError:
+        onnxoptimizer = None  # type: ignore[assignment]
+
+    if onnxoptimizer is not None:
+        safe_passes = [
+            "eliminate_nop_cast",
+            "eliminate_identity",
+            "fuse_consecutive_squeezes",
+            "fuse_consecutive_transposes",
+            "fuse_consecutive_concats",
+            "extract_constant_to_initializer",
+        ]
+        available = set(onnxoptimizer.get_available_passes())
+        passes = [p for p in safe_passes if p in available]
+        if passes:
+            try:
+                return onnxoptimizer.optimize(model, passes)
+            except Exception as exc:  # pylint: disable=broad-except
+                warnings.warn(
+                    "Entry-level onnxoptimizer.optimize() failed; continuing "
+                    f"with the unfolded ONNX model. Reason: {exc!r}"
+                )
+
+    # No folder available — silent, since this is just an optimization.
+    return model
+
+
 def from_onnx(
     model: onnx.onnx_ml_pb2.GraphProto,
     shape_dict: Optional[Dict[str, List]] = None,
@@ -4164,6 +4311,7 @@ def from_onnx(
     opset: int = None,
     keep_params_in_input: bool = False,
     sanitize_input_names: bool = True,
+    enable_constant_fold: Optional[bool] = None,
 ) -> IRModule:
     """Convert a ONNX model into an equivalent Relax Function.
     ONNX graphs are represented as Python Protobuf objects.
