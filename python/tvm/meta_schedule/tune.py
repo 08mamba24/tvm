@@ -15,6 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 """The core tuning API"""
+import logging
+import os
 from typing import List, Optional
 
 from .builder import Builder
@@ -25,6 +27,72 @@ from .runner import Runner
 from .task_scheduler import TaskScheduler
 from .tune_context import TuneContext
 from .post_optimization import PostOpt
+
+logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
+
+# Cross-session cost-model reuse (fork extension, default-inert):
+# when TVM_MS_COST_MODEL is set and the caller asked for the default "xgb"
+# cost model by name, load the model from that path before tuning (if the
+# file exists) and save it back after tuning completes successfully.
+_COST_MODEL_ENV = "TVM_MS_COST_MODEL"
+
+
+def _cost_model_reuse_path(cost_model_spec) -> Optional[str]:
+    path = os.environ.get(_COST_MODEL_ENV, "").strip()
+    if not path:
+        return None
+    if cost_model_spec != "xgb":
+        logger.warning(
+            "[ms-cost-model] %s is set but cost_model=%r is not 'xgb'; ignoring it",
+            _COST_MODEL_ENV,
+            cost_model_spec,
+        )
+        return None
+    return path
+
+
+def _load_cost_model(path: str, num_cores: int) -> Optional[CostModel]:
+    try:
+        cost_model = CostModel.create("xgb", num_tuning_cores=num_cores, tree_method="auto")
+        cost_model.load(path)
+    except Exception as err:  # pylint: disable=broad-except
+        logger.warning(
+            "[ms-cost-model] failed to load cost model from %s (%s: %s); "
+            "falling back to a fresh model",
+            path,
+            type(err).__name__,
+            err,
+        )
+        return None
+    logger.warning(
+        "[ms-cost-model] loaded cost model from %s (data_size=%s)",
+        path,
+        getattr(cost_model, "data_size", "n/a"),
+    )
+    return cost_model
+
+
+def _save_cost_model(cost_model: CostModel, path: str) -> None:
+    # Atomic write: a crash mid-save must never clobber a healthy model file.
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    try:
+        cost_model.save(tmp_path)
+        os.replace(tmp_path, path)
+    except Exception as err:  # pylint: disable=broad-except
+        logger.warning(
+            "[ms-cost-model] failed to save cost model to %s (%s: %s)",
+            path,
+            type(err).__name__,
+            err,
+        )
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        return
+    logger.warning(
+        "[ms-cost-model] saved cost model to %s (data_size=%s)",
+        path,
+        getattr(cost_model, "data_size", "n/a"),
+    )
 
 
 def tune_tasks(
@@ -111,8 +179,16 @@ def tune_tasks(
         database = Database.create(database, work_dir=work_dir, module_equality=module_equality)
     elif not isinstance(database, Database):
         database = Database.create(database, module_equality=module_equality)
+    cost_model_reuse_path = None
     if not isinstance(cost_model, CostModel):
-        cost_model = CostModel.create(cost_model, num_tuning_cores=num_cores, tree_method="auto")
+        cost_model_reuse_path = _cost_model_reuse_path(cost_model)
+        loaded = None
+        if cost_model_reuse_path and os.path.exists(cost_model_reuse_path):
+            loaded = _load_cost_model(cost_model_reuse_path, num_cores)
+        if loaded is not None:
+            cost_model = loaded
+        else:
+            cost_model = CostModel.create(cost_model, num_tuning_cores=num_cores, tree_method="auto")
     if isinstance(measure_callbacks, MeasureCallback):
         measure_callbacks = [measure_callbacks]
     elif measure_callbacks == "default":
@@ -131,6 +207,10 @@ def tune_tasks(
         database=database,
         cost_model=cost_model,
     )
+    # Save only after tuning completed successfully; a tuning exception must
+    # propagate without overwriting the previous model file.
+    if cost_model_reuse_path is not None:
+        _save_cost_model(cost_model, cost_model_reuse_path)
     if post_optimization:
         post_opt = PostOpt(work_dir, tasks[0].target)
         post_opt.run()
