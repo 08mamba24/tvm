@@ -18,6 +18,8 @@
 Meta Schedule search strategy that generates the measure
 candidates for measurement.
 """
+import logging
+import os
 from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 # isort: off
@@ -36,6 +38,33 @@ if TYPE_CHECKING:
     from ..cost_model import CostModel
     from ..database import Database
     from ..tune_context import TuneContext
+
+logger = logging.getLogger(__name__)
+
+# Opt-in override for the evolutionary population size (mirrors TVM_MS_COST_MODEL
+# in tune.py): unset/empty means byte-for-byte default behavior. Only fills the
+# kwarg when the caller did not choose one; pre-built strategy instances never
+# pass through create() and are therefore never affected.
+_POPULATION_ENV = "TVM_MS_POPULATION"
+_population_logged = False
+
+
+def _population_from_env() -> Optional[int]:
+    raw = os.environ.get(_POPULATION_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value <= 0:
+        logger.warning(
+            "[ms-population] ignoring invalid %s=%r (expect positive int)",
+            _POPULATION_ENV,
+            raw,
+        )
+        return None
+    return value
 
 
 @register_object("meta_schedule.MeasureCandidate")
@@ -193,6 +222,17 @@ class SearchStrategy(Object):
         )
 
         if kind == "evolutionary":
+            population = _population_from_env()
+            if population is not None and not args and "population_size" not in kwargs:
+                global _population_logged  # pylint: disable=global-statement
+                if not _population_logged:
+                    logger.warning(
+                        "[ms-population] population_size=%d from env %s",
+                        population,
+                        _POPULATION_ENV,
+                    )
+                    _population_logged = True
+                kwargs["population_size"] = population
             return EvolutionarySearch(*args, **kwargs)
         if kind == "replay-trace":
             return ReplayTrace(*args, **kwargs)
