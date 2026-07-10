@@ -95,6 +95,29 @@ def _save_cost_model(cost_model: CostModel, path: str) -> None:
     )
 
 
+_SKIP_TUNED_ENV = "TVM_MS_SKIP_TUNED"
+
+
+def _skip_tuned_enabled() -> bool:
+    return os.environ.get(_SKIP_TUNED_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _filter_tuned_tasks(tasks, task_weights, database):
+    # Hit criterion is query_tuning_record, NOT has_workload: a workload can be
+    # registered with zero valid records (orphan, or failure-only records) and
+    # such tasks must still be tuned. query_tuning_record applies the same
+    # IsValid filtering the compile-time ApplyDatabase query uses, so "skip"
+    # exactly matches "compile can already replay it".
+    kept_tasks, kept_weights, skipped = [], [], []
+    for task, weight in zip(tasks, task_weights):
+        if database.query_tuning_record(task.mod, task.target, task.task_name) is not None:
+            skipped.append(str(task.task_name))
+        else:
+            kept_tasks.append(task)
+            kept_weights.append(weight)
+    return kept_tasks, kept_weights, skipped
+
+
 def tune_tasks(
     *,
     tasks: List[TuneContext],
@@ -179,6 +202,17 @@ def tune_tasks(
         database = Database.create(database, work_dir=work_dir, module_equality=module_equality)
     elif not isinstance(database, Database):
         database = Database.create(database, module_equality=module_equality)
+    if _skip_tuned_enabled():
+        tasks, task_weights, skipped = _filter_tuned_tasks(tasks, task_weights, database)
+        logger.warning(
+            "[ms-skip-tuned] skipped %d task(s) with existing valid tuning records; "
+            "%d task(s) remain%s",
+            len(skipped),
+            len(tasks),
+            f" (skipped: {', '.join(skipped[:10])})" if skipped else "",
+        )
+        if not tasks:
+            return database
     cost_model_reuse_path = None
     if not isinstance(cost_model, CostModel):
         cost_model_reuse_path = _cost_model_reuse_path(cost_model)
