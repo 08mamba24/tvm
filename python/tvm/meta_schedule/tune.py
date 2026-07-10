@@ -118,6 +118,89 @@ def _filter_tuned_tasks(tasks, task_weights, database):
     return kept_tasks, kept_weights, skipped
 
 
+_DRIFT_CUT_ENV = "TVM_MS_DRIFT_CUT"
+# Mirrors the 0.9 vendor defaults: cut only when the frozen model tracks the
+# warmup measurements closely (1 - cos < 0.1), and never cut below 70%.
+_DRIFT_THRESHOLD = 0.1
+
+
+def _drift_cut_threshold() -> Optional[float]:
+    """None = disabled; flag values use the 0.9-faithful default threshold.
+
+    A float value overrides the threshold: measured in-sample drift can sit
+    above 0.1 when the loaded model is young (few samples), so the 0.9 default
+    may never fire until the model has accumulated multiple sessions.
+    """
+    raw = os.environ.get(_DRIFT_CUT_ENV, "").strip().lower()
+    if not raw:
+        return None
+    if raw in ("1", "true", "yes", "on"):
+        return _DRIFT_THRESHOLD
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 0.0
+    if not 0.0 < value < 1.0:
+        logger.warning(
+            "[ms-drift-cut] ignoring invalid %s=%r (expect flag or float in (0,1))",
+            _DRIFT_CUT_ENV,
+            raw,
+        )
+        return None
+    return value
+
+
+def _compute_drift(frozen_model, records, target) -> Optional[float]:
+    """1 - cos(measured normalized throughputs, frozen-model predictions).
+
+    Grouped per workload so throughput normalization stays within-task,
+    matching what the model was trained to predict. None when there is
+    nothing valid to compare (caller must not cut in that case).
+    """
+    import numpy as np  # pylint: disable=import-outside-toplevel
+
+    from tvm.ir import structural_hash  # pylint: disable=import-outside-toplevel
+
+    groups = {}
+    for rec in records:
+        run_secs = [float(x) for x in (rec.run_secs or [])]
+        if not run_secs:
+            continue
+        cost = float(np.median(run_secs))
+        if not 0 < cost < 1e9:
+            continue
+        key = structural_hash(rec.workload.mod)
+        groups.setdefault(key, (rec.workload.mod, [], []))
+        groups[key][1].append(rec)
+        groups[key][2].append(cost)
+
+    measured, predicted = [], []
+    for mod, recs, costs in groups.values():
+        try:
+            context = TuneContext(mod=mod, target=target)
+            candidates = [r.as_measure_candidate() for r in recs]
+            scores = frozen_model.predict(context, candidates)
+        except Exception as err:  # pylint: disable=broad-except
+            logger.warning(
+                "[ms-drift-cut] drift scoring failed for one workload (%s: %s); skipping it",
+                type(err).__name__,
+                err,
+            )
+            continue
+        min_cost = min(costs)
+        measured.extend(min_cost / c for c in costs)
+        predicted.extend(float(s) for s in scores)
+
+    if len(measured) < 2:
+        return None
+    a = np.asarray(measured, dtype="float64")
+    b = np.asarray(predicted, dtype="float64")
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    if denom == 0 or not np.isfinite(denom):
+        return None
+    return float(1.0 - float(np.dot(a, b)) / denom)
+
+
 def tune_tasks(
     *,
     tasks: List[TuneContext],
@@ -214,6 +297,7 @@ def tune_tasks(
         if not tasks:
             return database
     cost_model_reuse_path = None
+    cost_model_was_loaded = False
     if not isinstance(cost_model, CostModel):
         cost_model_reuse_path = _cost_model_reuse_path(cost_model)
         loaded = None
@@ -221,6 +305,7 @@ def tune_tasks(
             loaded = _load_cost_model(cost_model_reuse_path, num_cores)
         if loaded is not None:
             cost_model = loaded
+            cost_model_was_loaded = True
         else:
             cost_model = CostModel.create(cost_model, num_tuning_cores=num_cores, tree_method="auto")
     if isinstance(measure_callbacks, MeasureCallback):
@@ -229,18 +314,69 @@ def tune_tasks(
         measure_callbacks = MeasureCallback.create(measure_callbacks)
     if not isinstance(task_scheduler, TaskScheduler):
         task_scheduler = TaskScheduler.create(task_scheduler)
-    task_scheduler.tune(
-        tasks=tasks,
-        task_weights=task_weights,
-        max_trials_global=max_trials_global,
-        max_trials_per_task=max_trials_per_task,
-        num_trials_per_iter=num_trials_per_iter,
-        builder=builder,
-        runner=runner,
-        measure_callbacks=measure_callbacks,
-        database=database,
-        cost_model=cost_model,
-    )
+
+    def _run_tune(budget: int) -> None:
+        task_scheduler.tune(
+            tasks=tasks,
+            task_weights=task_weights,
+            max_trials_global=budget,
+            max_trials_per_task=max_trials_per_task,
+            num_trials_per_iter=num_trials_per_iter,
+            builder=builder,
+            runner=runner,
+            measure_callbacks=measure_callbacks,
+            database=database,
+            cost_model=cost_model,
+        )
+
+    # Drift-cut (0.9 vendor lever): after one warmup round per task, compare a
+    # FROZEN copy of the loaded model against the warmup measurements; when the
+    # model already tracks this terrain (drift < 0.1) the remaining budget is
+    # cut to (0.7 + 0.3 * drift). Cut-only, one-time. Requires a loaded model
+    # and a budget larger than the warmup itself; otherwise single-phase as-is.
+    warmup_budget = num_trials_per_iter * len(tasks)
+    drift_threshold = _drift_cut_threshold()
+    if (
+        drift_threshold is not None
+        and cost_model_was_loaded
+        and max_trials_global > warmup_budget
+    ):
+        n_before = len(database.get_all_tuning_records())
+        _run_tune(warmup_budget)
+        new_records = list(database.get_all_tuning_records())[n_before:]
+        frozen = _load_cost_model(cost_model_reuse_path, num_cores)
+        drift = None
+        if frozen is not None:
+            drift = _compute_drift(frozen, new_records, tasks[0].target)
+        remaining = max_trials_global - warmup_budget
+        if drift is not None and drift < drift_threshold:
+            cut = int(remaining * (0.7 + 0.3 * drift))
+            logger.warning(
+                "[ms-drift-cut] drift=%.4f < %.2f -> remaining budget %d -> %d",
+                drift,
+                drift_threshold,
+                remaining,
+                cut,
+            )
+            remaining = cut
+        else:
+            logger.warning(
+                "[ms-drift-cut] drift=%s >= %.2f (or n/a) -> no cut (remaining %d)",
+                f"{drift:.4f}" if drift is not None else "n/a",
+                drift_threshold,
+                remaining,
+            )
+        if remaining > 0:
+            _run_tune(remaining)
+    else:
+        if drift_threshold is not None:
+            logger.warning(
+                "[ms-drift-cut] inactive (loaded_model=%s, budget %d <= warmup %d)",
+                cost_model_was_loaded,
+                max_trials_global,
+                warmup_budget,
+            )
+        _run_tune(max_trials_global)
     # Save only after tuning completed successfully; a tuning exception must
     # propagate without overwriting the previous model file.
     if cost_model_reuse_path is not None:
