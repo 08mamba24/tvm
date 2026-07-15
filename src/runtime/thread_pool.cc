@@ -38,6 +38,8 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iomanip>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -45,6 +47,9 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#if !defined(_WIN32)
+#include <dlfcn.h>
+#endif
 
 #include "../support/utils.h"
 const constexpr int kL1CacheBytes = 64;
@@ -566,6 +571,145 @@ struct ParallelRegionProfile {
 // naturally per-instance and lock-free.
 thread_local std::unordered_map<uintptr_t, ParallelRegionProfile> g_region_profiles;
 
+// Chrome Trace timeline of parallel-region launches (the 0.9 custom
+// TVM_TIMELINE_ENABLE, ported to this universal hook so it covers BOTH relax VM
+// exec_modes — the VM profiler's per-op report is bytecode-only). Every launch
+// records wall-clock start + duration + the thread count actually used, so the
+// gaps BETWEEN regions and the adaptive per-region decision are both visible.
+// Env vocabulary matches 0.9:
+//   TVM_TIMELINE_ENABLE=1        turn on (default off: cost is one cached bool)
+//   TVM_TIMELINE_OUTPUT_FILE=f   output path (default tvm_timeline.json), written
+//                                once at process exit
+//   TVM_TIMELINE_MAX_EVENTS=n    recording cap (default 1e6); excess is counted
+//                                and reported, never silently dropped
+// Scope: native pthread pool, num_workers>1 launches only (the single-worker
+// inline path and OpenMP builds are not recorded).
+struct TimelineConfig {
+  bool enabled = false;
+  std::string path = "tvm_timeline.json";
+  uint64_t max_events = 1000000;
+  TimelineConfig() {
+    const char* e = std::getenv("TVM_TIMELINE_ENABLE");
+    enabled = (e != nullptr && std::atoi(e) == 1);
+    const char* p = std::getenv("TVM_TIMELINE_OUTPUT_FILE");
+    if (p != nullptr && p[0] != '\0') path = p;
+    const char* m = std::getenv("TVM_TIMELINE_MAX_EVENTS");
+    if (m != nullptr) max_events = std::strtoull(m, nullptr, 10);
+  }
+};
+const TimelineConfig& GetTimelineConfig() {
+  static TimelineConfig cfg;
+  return cfg;
+}
+
+struct TimelineEvent {
+  uintptr_t region;
+  uint64_t tid;
+  double ts_us;
+  double dur_us;
+  int num_task;
+  int8_t phase;  // 0 = steady/adaptive-off, 1 = warmup FULL sample, 2 = warmup MIN sample
+};
+
+class TimelineRecorder {
+ public:
+  // Region naming: parallel lambdas are LOCAL symbols in the model .so, invisible
+  // to dladdr (dynamic symtab only). dladdr still gives module path + load base,
+  // so we emit module+offset per event and symbolize_timeline.py maps offsets to
+  // the local `<kernel>_compute_` symbols via `nm -n` offline. If dladdr does
+  // resolve a name (exported symbol), it is used directly.
+  struct RegionInfo {
+    std::string name;
+    std::string module;
+    uintptr_t offset = 0;
+  };
+
+  static TimelineRecorder& Global() {
+    static TimelineRecorder inst;  // destructor at static teardown writes the file
+    return inst;
+  }
+
+  void Record(const void* region, std::chrono::steady_clock::time_point t0,
+              std::chrono::steady_clock::time_point t1, int num_task, int phase) {
+    // tid = launching thread: one trace row per model-instance thread.
+    uint64_t tid = std::hash<std::thread::id>()(std::this_thread::get_id()) & 0xfffff;
+    uintptr_t key = reinterpret_cast<uintptr_t>(region);
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!epoch_valid_) {
+      epoch_ = t0;  // first event defines t=0 (Global() is constructed after its t0)
+      epoch_valid_ = true;
+    }
+    if (regions_.find(key) == regions_.end()) {
+      // Resolve NOW, not at dump: the dump runs at static teardown, after the model
+      // .so may have been dlclosed, when dladdr can no longer find the image.
+      RegionInfo ri;
+#if !defined(_WIN32)
+      Dl_info info;
+      if (dladdr(region, &info) != 0) {
+        if (info.dli_sname != nullptr) ri.name = info.dli_sname;
+        if (info.dli_fname != nullptr) {
+          ri.module = info.dli_fname;
+          ri.offset = key - reinterpret_cast<uintptr_t>(info.dli_fbase);
+        }
+      }
+#endif
+      if (ri.name.empty()) {
+        std::ostringstream oss;
+        oss << "region_0x" << std::hex << key;
+        ri.name = oss.str();
+      }
+      regions_.emplace(key, std::move(ri));
+    }
+    if (events_.size() >= GetTimelineConfig().max_events) {
+      ++dropped_;
+      return;
+    }
+    events_.push_back({key, tid, std::chrono::duration<double, std::micro>(t0 - epoch_).count(),
+                       std::chrono::duration<double, std::micro>(t1 - t0).count(), num_task,
+                       static_cast<int8_t>(phase)});
+  }
+
+  ~TimelineRecorder() {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (events_.empty()) return;
+    const TimelineConfig& cfg = GetTimelineConfig();
+    std::ofstream os(cfg.path);
+    if (!os) {
+      std::cerr << "[TIMELINE] cannot open " << cfg.path << std::endl;
+      return;
+    }
+    os << std::fixed << std::setprecision(3);
+    os << "{\"displayTimeUnit\":\"ms\",\"traceEvents\":[";
+    static const char* kPhase[] = {"steady", "warmup_full", "warmup_min"};
+    bool first = true;
+    const RegionInfo kUnknown;  // defensive only: Record always registers the region
+    for (const TimelineEvent& ev : events_) {
+      auto it = regions_.find(ev.region);
+      const RegionInfo& ri = (it != regions_.end()) ? it->second : kUnknown;
+      if (!first) os << ",";
+      first = false;
+      os << "\n{\"name\":\"" << ri.name << "\",\"ph\":\"X\",\"cat\":\"parallel_region\""
+         << ",\"pid\":1,\"tid\":" << ev.tid << ",\"ts\":" << ev.ts_us << ",\"dur\":" << ev.dur_us
+         << ",\"args\":{\"num_task\":" << ev.num_task << ",\"phase\":\"" << kPhase[ev.phase]
+         << "\",\"module\":\"" << ri.module << "\",\"offset\":\"0x" << std::hex << ri.offset
+         << std::dec << "\"}}";
+    }
+    os << "\n]}\n";
+    // std::cerr, not LOG(INFO): logging infra may already be torn down at static exit.
+    std::cerr << "[TIMELINE] wrote " << events_.size() << " events to " << cfg.path;
+    if (dropped_ > 0) std::cerr << " (dropped " << dropped_ << " over TVM_TIMELINE_MAX_EVENTS)";
+    std::cerr << std::endl;
+  }
+
+ private:
+  std::mutex mu_;
+  std::vector<TimelineEvent> events_;
+  std::unordered_map<uintptr_t, RegionInfo> regions_;
+  std::chrono::steady_clock::time_point epoch_;
+  bool epoch_valid_ = false;
+  uint64_t dropped_ = 0;
+};
+
 }  // namespace
 
 // Test-only hooks: the production config is read from env exactly once and cannot be
@@ -670,14 +814,28 @@ int TVMBackendParallelLaunch(FTVMParallelLambda flambda, void* cdata, int num_ta
     if (sampling != 0) {
       auto t0 = std::chrono::steady_clock::now();
       int res = tvm::runtime::ThreadPool::ThreadLocal()->Launch(flambda, cdata, num_task, 1);
-      double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0)
-                      .count();
+      auto t1 = std::chrono::steady_clock::now();
+      double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
       if (sampling == 1) {
         prof->ema_full = (prof->ema_full == 0.0) ? us : 0.5 * prof->ema_full + 0.5 * us;
       } else {
         prof->ema_min = (prof->ema_min == 0.0) ? us : 0.5 * prof->ema_min + 0.5 * us;
       }
       prof->calls++;
+      if (tvm::runtime::GetTimelineConfig().enabled) {
+        int eff = num_task == 0 ? tvm::runtime::threading::NumThreads() : num_task;
+        tvm::runtime::TimelineRecorder::Global().Record(reinterpret_cast<void*>(flambda), t0, t1,
+                                                        eff, sampling);
+      }
+      return res;
+    }
+    if (tvm::runtime::GetTimelineConfig().enabled) {
+      auto t0 = std::chrono::steady_clock::now();
+      int res = tvm::runtime::ThreadPool::ThreadLocal()->Launch(flambda, cdata, num_task, 1);
+      auto t1 = std::chrono::steady_clock::now();
+      int eff = num_task == 0 ? tvm::runtime::threading::NumThreads() : num_task;
+      tvm::runtime::TimelineRecorder::Global().Record(reinterpret_cast<void*>(flambda), t0, t1,
+                                                      eff, /*phase=steady*/ 0);
       return res;
     }
     int res = tvm::runtime::ThreadPool::ThreadLocal()->Launch(flambda, cdata, num_task, 1);
