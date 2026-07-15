@@ -603,12 +603,14 @@ const TimelineConfig& GetTimelineConfig() {
 }
 
 struct TimelineEvent {
-  uintptr_t region;
+  uintptr_t region;   // parallel-launch track: flambda key; kernel track: 0
+  int32_t name_idx;   // kernel track: index into named_; parallel-launch track: -1
   uint64_t tid;
   double ts_us;
   double dur_us;
-  int num_task;
+  int num_task;  // kernel track: -1
   int8_t phase;  // 0 = steady/adaptive-off, 1 = warmup FULL sample, 2 = warmup MIN sample
+  const char* cat;  // static string: "parallel_region" | "kernel"
 };
 
 class TimelineRecorder {
@@ -664,9 +666,35 @@ class TimelineRecorder {
       ++dropped_;
       return;
     }
-    events_.push_back({key, tid, std::chrono::duration<double, std::micro>(t0 - epoch_).count(),
+    events_.push_back({key, -1, tid, std::chrono::duration<double, std::micro>(t0 - epoch_).count(),
                        std::chrono::duration<double, std::micro>(t1 - t0).count(), num_task,
-                       static_cast<int8_t>(phase)});
+                       static_cast<int8_t>(phase), "parallel_region"});
+  }
+
+  // Kernel-track event from TVMBackendTimelineBegin/End instrumentation. The name is a
+  // string constant inside the (possibly later-dlclosed) model .so, so it is interned
+  // into named_ immediately — same lifetime lesson as the dladdr-at-Record rule above.
+  void RecordNamed(const char* name, std::chrono::steady_clock::time_point t0,
+                   std::chrono::steady_clock::time_point t1) {
+    uint64_t tid = std::hash<std::thread::id>()(std::this_thread::get_id()) & 0xfffff;
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!epoch_valid_) {
+      epoch_ = t0;
+      epoch_valid_ = true;
+    }
+    auto it = name_ids_.find(name);
+    if (it == name_ids_.end()) {
+      it = name_ids_.emplace(name, static_cast<int32_t>(named_.size())).first;
+      named_.emplace_back(name);
+    }
+    if (events_.size() >= GetTimelineConfig().max_events) {
+      ++dropped_;
+      return;
+    }
+    events_.push_back({0, it->second, tid,
+                       std::chrono::duration<double, std::micro>(t0 - epoch_).count(),
+                       std::chrono::duration<double, std::micro>(t1 - t0).count(), -1, 0,
+                       "kernel"});
   }
 
   ~TimelineRecorder() {
@@ -684,12 +712,18 @@ class TimelineRecorder {
     bool first = true;
     const RegionInfo kUnknown;  // defensive only: Record always registers the region
     for (const TimelineEvent& ev : events_) {
-      auto it = regions_.find(ev.region);
-      const RegionInfo& ri = (it != regions_.end()) ? it->second : kUnknown;
       if (!first) os << ",";
       first = false;
-      os << "\n{\"name\":\"" << ri.name << "\",\"ph\":\"X\",\"cat\":\"parallel_region\""
-         << ",\"pid\":1,\"tid\":" << ev.tid << ",\"ts\":" << ev.ts_us << ",\"dur\":" << ev.dur_us
+      if (ev.name_idx >= 0) {  // kernel track (Begin/End instrumentation)
+        os << "\n{\"name\":\"" << named_[ev.name_idx] << "\",\"ph\":\"X\",\"cat\":\"" << ev.cat
+           << "\",\"pid\":1,\"tid\":" << ev.tid << ",\"ts\":" << ev.ts_us
+           << ",\"dur\":" << ev.dur_us << "}";
+        continue;
+      }
+      auto it = regions_.find(ev.region);
+      const RegionInfo& ri = (it != regions_.end()) ? it->second : kUnknown;
+      os << "\n{\"name\":\"" << ri.name << "\",\"ph\":\"X\",\"cat\":\"" << ev.cat
+         << "\",\"pid\":1,\"tid\":" << ev.tid << ",\"ts\":" << ev.ts_us << ",\"dur\":" << ev.dur_us
          << ",\"args\":{\"num_task\":" << ev.num_task << ",\"phase\":\"" << kPhase[ev.phase]
          << "\",\"module\":\"" << ri.module << "\",\"offset\":\"0x" << std::hex << ri.offset
          << std::dec << "\"}}";
@@ -705,10 +739,19 @@ class TimelineRecorder {
   std::mutex mu_;
   std::vector<TimelineEvent> events_;
   std::unordered_map<uintptr_t, RegionInfo> regions_;
+  // Kernel-track name interning. Keyed by the string-constant pointer (stable per
+  // loaded module, one map hit per call site) with the text copied into named_.
+  std::unordered_map<const char*, int32_t> name_ids_;
+  std::vector<std::string> named_;
   std::chrono::steady_clock::time_point epoch_;
   bool epoch_valid_ = false;
   uint64_t dropped_ = 0;
 };
+
+// Per-thread stack of open TVMBackendTimelineBegin frames. Kernels are entered and
+// left on the same (launching) thread; a stack keeps nested/fused calls correct.
+thread_local std::vector<std::pair<const char*, std::chrono::steady_clock::time_point>>
+    g_timeline_kernel_stack;
 
 }  // namespace
 
@@ -852,6 +895,28 @@ int TVMBackendParallelLaunch(FTVMParallelLambda flambda, void* cdata, int num_ta
     return 0;
 #endif
   }
+}
+
+// Kernel-track instrumentation entry points (fork extension, see c_backend_api.h).
+// Emitted as call_extern at PrimFunc entry/exit by the compile-side
+// instrument_timeline pass; resolved from libtvm at .so load exactly like
+// TVMBackendParallelLaunch, so they work in BOTH relax VM exec_modes and cover
+// kernels that have no parallel loop (which never reach the launch hook above).
+int TVMBackendTimelineBegin(const char* name) {
+  if (!tvm::runtime::GetTimelineConfig().enabled) return 0;
+  tvm::runtime::g_timeline_kernel_stack.emplace_back(name, std::chrono::steady_clock::now());
+  return 0;
+}
+
+int TVMBackendTimelineEnd(void) {
+  if (!tvm::runtime::GetTimelineConfig().enabled) return 0;
+  auto& stack = tvm::runtime::g_timeline_kernel_stack;
+  if (stack.empty()) return 0;  // unmatched End (e.g. env flipped mid-run): ignore
+  auto frame = stack.back();
+  stack.pop_back();
+  tvm::runtime::TimelineRecorder::Global().RecordNamed(frame.first, frame.second,
+                                                       std::chrono::steady_clock::now());
+  return 0;
 }
 
 int TVMBackendParallelBarrier(int task_id, TVMParallelGroupEnv* penv) {

@@ -117,6 +117,25 @@ TVM_DLL int TVMBackendParallelLaunch(FTVMParallelLambda flambda, void* cdata, in
 TVM_DLL int TVMBackendParallelBarrier(int task_id, TVMParallelGroupEnv* penv);
 
 /*!
+ * \brief [fork extension] Mark the entry of an instrumented kernel for the
+ *  TVM_TIMELINE_ENABLE Chrome-Trace timeline (see thread_pool.cc). Emitted as a
+ *  call_extern at PrimFunc entry by the compile-side instrument_timeline pass, so
+ *  coverage is exec_mode independent and includes kernels with no parallel loop.
+ *  No-op (one cached bool check) when the timeline is disabled.
+ *
+ * \param name The kernel name (string constant baked into the module).
+ * \return Always 0.
+ */
+TVM_DLL int TVMBackendTimelineBegin(const char* name);
+
+/*!
+ * \brief [fork extension] Mark the exit of the innermost kernel opened by
+ *  TVMBackendTimelineBegin on this thread, recording one timeline event.
+ * \return Always 0.
+ */
+TVM_DLL int TVMBackendTimelineEnd(void);
+
+/*!
  * \brief Simple static initialization function.
  *  Run f once and set handle to be not null.
  *  This function is mainly used for test purpose.
