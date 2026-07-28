@@ -582,12 +582,16 @@ thread_local std::unordered_map<uintptr_t, ParallelRegionProfile> g_region_profi
 //                                once at process exit
 //   TVM_TIMELINE_MAX_EVENTS=n    recording cap (default 1e6); excess is counted
 //                                and reported, never silently dropped
+//   TVM_TIMELINE_CAPTURE_REQUEST=N  1-based: only record the Nth `main` inference
+//                                (directed capture). Default unset = full mode
+//                                (record every request for the whole process).
 // Scope: native pthread pool, num_workers>1 launches only (the single-worker
 // inline path and OpenMP builds are not recorded).
 struct TimelineConfig {
   bool enabled = false;
   std::string path = "tvm_timeline.json";
   uint64_t max_events = 1000000;
+  int capture_request = -1;  // >0 = directed (Nth main only); -1 = full mode
   TimelineConfig() {
     const char* e = std::getenv("TVM_TIMELINE_ENABLE");
     enabled = (e != nullptr && std::atoi(e) == 1);
@@ -595,6 +599,17 @@ struct TimelineConfig {
     if (p != nullptr && p[0] != '\0') path = p;
     const char* m = std::getenv("TVM_TIMELINE_MAX_EVENTS");
     if (m != nullptr) max_events = std::strtoull(m, nullptr, 10);
+    const char* cr = std::getenv("TVM_TIMELINE_CAPTURE_REQUEST");
+    if (cr != nullptr && cr[0] != '\0') {
+      char* endp = nullptr;
+      long v = std::strtol(cr, &endp, 10);
+      if (endp != cr && *endp == '\0' && v > 0 && v <= 0x7fffffff) {
+        capture_request = static_cast<int>(v);
+      } else {
+        std::cerr << "[TIMELINE] invalid TVM_TIMELINE_CAPTURE_REQUEST='" << cr
+                  << "' (must be positive integer), falling back to full mode" << std::endl;
+      }
+    }
   }
 };
 const TimelineConfig& GetTimelineConfig() {
@@ -610,8 +625,18 @@ struct TimelineEvent {
   double dur_us;
   int num_task;  // kernel track: -1
   int8_t phase;  // 0 = steady/adaptive-off, 1 = warmup FULL sample, 2 = warmup MIN sample
-  const char* cat;  // static string: "parallel_region" | "kernel"
+  const char* cat;  // static string: "parallel_region" | "kernel" | "inference"
+  int request_index = -1;  // >= 0 for cat=inference root events; -1 otherwise
 };
+
+// Per-thread capture context: avoids cross-VM interference when two VM instances
+// run on different threads simultaneously. Set by EnterCapture on the VM's main
+// thread; Record/RecordNamed read it on the same thread (parallel-launch Record
+// runs on the launching thread, kernel Begin/End on the executing thread — both
+// are the VM's main thread for relax compiled/bytecode execution).
+thread_local bool tl_capture_active = false;
+thread_local int tl_capture_req_index = -1;
+thread_local std::chrono::steady_clock::time_point tl_capture_start{};
 
 class TimelineRecorder {
  public:
@@ -633,6 +658,9 @@ class TimelineRecorder {
 
   void Record(const void* region, std::chrono::steady_clock::time_point t0,
               std::chrono::steady_clock::time_point t1, int num_task, int phase) {
+    // Directed-capture gate: in full mode (capture_request < 0) pass through; in
+    // directed mode (capture_request > 0) only record while inside the target request.
+    if (GetTimelineConfig().capture_request > 0 && !tl_capture_active) return;
     // tid = launching thread: one trace row per model-instance thread.
     uint64_t tid = std::hash<std::thread::id>()(std::this_thread::get_id()) & 0xfffff;
     uintptr_t key = reinterpret_cast<uintptr_t>(region);
@@ -676,6 +704,7 @@ class TimelineRecorder {
   // into named_ immediately — same lifetime lesson as the dladdr-at-Record rule above.
   void RecordNamed(const char* name, std::chrono::steady_clock::time_point t0,
                    std::chrono::steady_clock::time_point t1) {
+    if (GetTimelineConfig().capture_request > 0 && !tl_capture_active) return;
     uint64_t tid = std::hash<std::thread::id>()(std::this_thread::get_id()) & 0xfffff;
     std::lock_guard<std::mutex> lock(mu_);
     if (!epoch_valid_) {
@@ -694,12 +723,66 @@ class TimelineRecorder {
     events_.push_back({0, it->second, tid,
                        std::chrono::duration<double, std::micro>(t0 - epoch_).count(),
                        std::chrono::duration<double, std::micro>(t1 - t0).count(), -1, 0,
-                       "kernel"});
+                        "kernel"});
+  }
+
+  // Directed-capture API: called by the VM layer around the Nth `main` invocation.
+  // EnterCapture marks the recorder as "inside target request" so Record/RecordNamed
+  // stop early-returning; ExitCapture pushes a cat=inference root event spanning the
+  // captured request and clears the flag. In full mode (capture_request < 0) the VM
+  // calls these for every request so the trace always has per-request boundaries.
+  void EnterCapture(int req_index) {
+    tl_capture_active = true;
+    tl_capture_req_index = req_index;
+    tl_capture_start = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!epoch_valid_) {
+      epoch_ = tl_capture_start;
+      epoch_valid_ = true;
+    }
+  }
+
+  void ExitCapture() {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!tl_capture_active) return;
+    auto now = std::chrono::steady_clock::now();
+    uint64_t tid = std::hash<std::thread::id>()(std::this_thread::get_id()) & 0xfffff;
+    if (events_.size() < GetTimelineConfig().max_events) {
+      events_.push_back({0, -1, tid,
+                         std::chrono::duration<double, std::micro>(tl_capture_start - epoch_).count(),
+                         std::chrono::duration<double, std::micro>(now - tl_capture_start).count(),
+                         -1, 0, "inference", tl_capture_req_index});
+    } else {
+      ++dropped_;
+    }
+    tl_capture_active = false;
   }
 
   ~TimelineRecorder() {
     std::lock_guard<std::mutex> lock(mu_);
-    if (events_.empty()) return;
+    if (events_.empty()) {
+      if (GetTimelineConfig().capture_request > 0) {
+        std::cerr << "[TIMELINE] TVM_TIMELINE_CAPTURE_REQUEST="
+                  << GetTimelineConfig().capture_request
+                  << " but target request was not reached; no trace written" << std::endl;
+      }
+      return;
+    }
+    // Negative-ts fix: the epoch is set by whichever event first reaches Record, which
+    // can be an inner parallel_region that finished before the outer kernel that started
+    // earlier — leaving the outer event with ts < 0 (Perfetto drops them). Rebase all
+    // events to the earliest start time and stable-sort so viewers see a clean timeline.
+    double min_ts = events_[0].ts_us;
+    for (const auto& ev : events_) {
+      if (ev.ts_us < min_ts) min_ts = ev.ts_us;
+    }
+    if (min_ts < 0.0) {
+      for (auto& ev : events_) ev.ts_us -= min_ts;
+    }
+    std::stable_sort(events_.begin(), events_.end(),
+                     [](const TimelineEvent& a, const TimelineEvent& b) {
+                       return a.ts_us < b.ts_us;
+                     });
     const TimelineConfig& cfg = GetTimelineConfig();
     std::ofstream os(cfg.path);
     if (!os) {
@@ -714,6 +797,13 @@ class TimelineRecorder {
     for (const TimelineEvent& ev : events_) {
       if (!first) os << ",";
       first = false;
+      if (ev.request_index >= 0) {  // cat=inference root event spanning one main call
+        os << "\n{\"name\":\"inference\",\"ph\":\"X\",\"cat\":\"" << ev.cat
+           << "\",\"pid\":1,\"tid\":" << ev.tid << ",\"ts\":" << ev.ts_us
+           << ",\"dur\":" << ev.dur_us << ",\"args\":{\"request_index\":" << ev.request_index
+           << "}}";
+        continue;
+      }
       if (ev.name_idx >= 0) {  // kernel track (Begin/End instrumentation)
         os << "\n{\"name\":\"" << named_[ev.name_idx] << "\",\"ph\":\"X\",\"cat\":\"" << ev.cat
            << "\",\"pid\":1,\"tid\":" << ev.tid << ",\"ts\":" << ev.ts_us
@@ -916,6 +1006,21 @@ int TVMBackendTimelineEnd(void) {
   stack.pop_back();
   tvm::runtime::TimelineRecorder::Global().RecordNamed(frame.first, frame.second,
                                                        std::chrono::steady_clock::now());
+  return 0;
+}
+
+// VM-layer directed-capture control (called from vm.cc around main invocation).
+// Thin wrappers so vm.cc does not need to reach into thread_pool.cc's anonymous
+// namespace; same pattern as TVMBackendTimelineBegin/End above.
+int TVMTimelineEnterCapture(int req_index) {
+  if (!tvm::runtime::GetTimelineConfig().enabled) return 0;
+  tvm::runtime::TimelineRecorder::Global().EnterCapture(req_index);
+  return 0;
+}
+
+int TVMTimelineExitCapture() {
+  if (!tvm::runtime::GetTimelineConfig().enabled) return 0;
+  tvm::runtime::TimelineRecorder::Global().ExitCapture();
   return 0;
 }
 

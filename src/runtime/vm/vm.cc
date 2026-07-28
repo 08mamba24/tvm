@@ -29,6 +29,13 @@
 
 #include <optional>
 #include <thread>
+#include <cstdlib>
+
+// Timeline directed-capture hooks (defined in thread_pool.cc; same extern pattern
+// as TVMBackendTimelineBegin/End — no shared header to avoid polluting the runtime
+// API surface for an experimental feature).
+int TVMTimelineEnterCapture(int req_index);
+int TVMTimelineExitCapture();
 
 namespace tvm {
 namespace runtime {
@@ -449,6 +456,33 @@ class VirtualMachineImpl : public VirtualMachine {
   RegType return_value_;
   /*!\ brief instrument function. */
   ffi::Function instrument_ = nullptr;
+
+  //------------------------------------------------------------
+  // Timeline directed-capture state (TVM_TIMELINE_CAPTURE_REQUEST=N)
+  //------------------------------------------------------------
+  // Counter is per-VM-instance (not global): multiple VMs in one process must not
+  // confuse each other's request numbering. target is read once from the env and
+  // shared across instances (env is immutable during the process lifetime).
+  int timeline_request_counter_{0};
+  static bool TimelineEnabled() {
+    static const bool enabled = [] {
+      const char* e = std::getenv("TVM_TIMELINE_ENABLE");
+      return e != nullptr && std::atoi(e) == 1;
+    }();
+    return enabled;
+  }
+  static int TimelineCaptureTarget() {
+    static const int target = [] {
+      const char* e = std::getenv("TVM_TIMELINE_CAPTURE_REQUEST");
+      if (e && e[0] != '\0') {
+        char* endp = nullptr;
+        long v = std::strtol(e, &endp, 10);
+        if (endp != e && *endp == '\0' && v > 0 && v <= 0x7fffffff) return static_cast<int>(v);
+      }
+      return -1;
+    }();
+    return target;
+  }
 };
 
 void VirtualMachineImpl::LoadExecutable(ObjectPtr<VMExecutable> exec) {
@@ -888,6 +922,22 @@ void VirtualMachineImpl::_InvokeClosureStateful(std::string func_name) {
                << "; use `set_input` first.";
     return;
   }
+  // Timeline directed-capture: mirror of _LookupFunction's scope wrapping for the
+  // stateful VM path (bytecode mode). Both paths must agree or bytecode/compiled
+  // diverge in what gets recorded.
+  bool enter_timeline = false;
+  if (TimelineEnabled() && func_name == "main") {
+    timeline_request_counter_ += 1;
+    int target = TimelineCaptureTarget();
+    enter_timeline = (target < 0) || (timeline_request_counter_ == target);
+    if (enter_timeline) TVMTimelineEnterCapture(timeline_request_counter_);
+  }
+  struct ExitGuard {
+    bool active;
+    ~ExitGuard() {
+      if (active) TVMTimelineExitCapture();
+    }
+  } guard{enter_timeline};
   outputs_[func_name] = this->InvokeClosureInternal(func_pool_[m.at(func_name)].cast<ObjectRef>(),
                                                     inputs_[func_name]);
 }
@@ -954,10 +1004,26 @@ std::string VirtualMachineImpl::_GetFunctionParamName(std::string func_name, int
 
 ffi::Function VirtualMachineImpl::_LookupFunction(const ffi::String& name) {
   if (ffi::Optional<VMClosure> opt = this->GetClosureInternal(name, true)) {
-    return ffi::Function([clo = opt.value(), _self = ffi::GetRef<ffi::Module>(this)](
-                             ffi::PackedArgs args, ffi::Any* rv) -> void {
+    return ffi::Function([clo = opt.value(), _self = ffi::GetRef<ffi::Module>(this),
+                          name = name](ffi::PackedArgs args, ffi::Any* rv) -> void {
       auto* self = const_cast<VirtualMachineImpl*>(_self.as<VirtualMachineImpl>());
       ICHECK(self);
+      // Timeline directed-capture: wrap "main" invocation. In full mode (target < 0)
+      // every request is captured so the trace always has per-request boundaries;
+      // in directed mode (target > 0) only request N is captured.
+      bool enter_timeline = false;
+      if (VirtualMachineImpl::TimelineEnabled() && name == "main") {
+        self->timeline_request_counter_ += 1;
+        int target = VirtualMachineImpl::TimelineCaptureTarget();
+        enter_timeline = (target < 0) || (self->timeline_request_counter_ == target);
+        if (enter_timeline) TVMTimelineEnterCapture(self->timeline_request_counter_);
+      }
+      struct ExitGuard {
+        bool active;
+        ~ExitGuard() {
+          if (active) TVMTimelineExitCapture();
+        }
+      } guard{enter_timeline};
       self->InvokeClosurePacked(clo, args, rv);
     });
   }
