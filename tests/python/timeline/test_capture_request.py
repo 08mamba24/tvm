@@ -184,5 +184,89 @@ def test_target_not_reached_no_file():
         os.unlink("/tmp/tl_target_unreached.json")
 
 
+RUNNER_CONCURRENT = r"""
+import os, sys, threading
+import numpy as np
+import tvm
+from tvm import relax
+from tvm.relax import BlockBuilder
+from tvm.relax.timeline import instrument_timeline
+
+N_OPS, M, D = 4, 32, 64
+rng = np.random.default_rng(0)
+bb = BlockBuilder()
+x = relax.Var("x", relax.TensorStructInfo((M, D), "float32"))
+ws = [(rng.standard_normal((D, D)) * 0.1).astype("float32") for _ in range(N_OPS)]
+with bb.function("main", [x]):
+    with bb.dataflow():
+        cur = x
+        for i in range(N_OPS):
+            cur = bb.emit(relax.op.matmul(cur, relax.const(ws[i])))
+            cur = bb.emit(relax.op.nn.relu(cur))
+        gv = bb.emit_output(cur)
+    bb.emit_func_output(gv)
+mod = bb.get()
+mod = relax.transform.LegalizeOps()(mod)
+mod = instrument_timeline(mod)
+ex = relax.build(mod, target=tvm.target.Target("llvm"), exec_mode="compiled")
+dev = tvm.cpu()
+vm = relax.VirtualMachine(ex, dev)
+xt = tvm.runtime.empty((M, D), "float32", dev)
+xt.copyfrom(rng.standard_normal((M, D)).astype("float32"))
+
+# Two threads share the process (and thus TimelineRecorder::Global()), but each
+# has its own thread_local capture state. Thread A reaches target=2 and captures;
+# Thread B runs once (target=2 not reached) — B's events must NOT leak into the
+# trace just because A's capture is active.
+errors = []
+def worker(n_runs, label):
+    try:
+        for _ in range(n_runs):
+            vm["main"](xt)
+    except Exception as e:
+        errors.append((label, str(e)))
+
+ta = threading.Thread(target=worker, args=(2, "A"))  # reaches target=2
+tb = threading.Thread(target=worker, args=(1, "B"))  # does not reach target
+ta.start(); tb.start()
+ta.join(); tb.join()
+if errors:
+    sys.exit(1)
+"""
+
+
+def test_concurrent_vms_no_leak():
+    """Two VMs on two threads: thread B's non-target events must not leak via
+    thread A's active capture (thread_local isolation, P1 fix)."""
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
+        trace_path = f.name
+    if os.path.exists(trace_path):
+        os.unlink(trace_path)
+    env = _subprocess_env({
+        "TVM_TIMELINE_ENABLE": "1",
+        "TVM_TIMELINE_CAPTURE_REQUEST": "2",
+        "TVM_TIMELINE_OUTPUT_FILE": trace_path,
+    })
+    result = subprocess.run(
+        [sys.executable, "-c", RUNNER_CONCURRENT],
+        env=env, capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, f"concurrent runner failed:\n{result.stderr[-800:]}"
+    assert os.path.exists(trace_path), "no trace file"
+    with open(trace_path) as f:
+        trace = json.load(f)
+    os.unlink(trace_path)
+    events = trace["traceEvents"]
+    inf = [e for e in events if e.get("cat") == "inference"]
+    assert len(inf) == 1, f"expected 1 inference (thread A req 2), got {len(inf)}"
+    assert inf[0]["args"]["request_index"] == 2
+    kernels = [e for e in events if e.get("cat") == "kernel"]
+    # Thread A's req 2: 4 matmul + 4 relu = 8 kernels. Thread B contributes 0
+    # (its tl_capture_active is false). If P1 were unfixed (global state), B's
+    # events would leak in and kernel count would be 16.
+    assert len(kernels) == 8, (
+        f"expected 8 kernels (thread A only), got {len(kernels)} — possible cross-thread leak")
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
