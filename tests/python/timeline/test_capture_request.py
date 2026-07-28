@@ -15,6 +15,8 @@ import pytest
 
 TVM_ROOT = Path(__file__).resolve().parents[3]
 
+PARALLEL_RUNNER = str(Path(__file__).resolve().parent / "_parallel_runner.py")
+
 RUNNER = r"""
 import os, sys
 import numpy as np
@@ -56,6 +58,12 @@ for _ in range(n_runs):
 
 def _subprocess_env(extra=None):
     env = dict(os.environ)
+    # FC-3: 子进程不得继承父进程的 timeline 变量——外层 TVM_TIMELINE_ENABLE=1
+    # 会让 test_env_off_no_file 等用例稳定失败（砚砚 fresh-context review FC-3）。
+    # 先清空，再 apply 各用例的 extra 参数。
+    for k in ("TVM_TIMELINE_ENABLE", "TVM_TIMELINE_CAPTURE_REQUEST",
+              "TVM_TIMELINE_OUTPUT_FILE", "TVM_TIMELINE_MAX_EVENTS"):
+        env.pop(k, None)
     env["PYTHONPATH"] = ":".join([
         str(TVM_ROOT / "python"),
         str(TVM_ROOT / "3rdparty" / "tvm-ffi" / "python"),
@@ -67,7 +75,7 @@ def _subprocess_env(extra=None):
     return env
 
 
-def _run_trace(env_extra, expect_file=True):
+def _run_trace(env_extra, expect_file=True, runner_script=None):
     """Run model in subprocess; return parsed trace dict or None if no file."""
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
         trace_path = f.name
@@ -75,9 +83,10 @@ def _run_trace(env_extra, expect_file=True):
         os.unlink(trace_path)
     env = _subprocess_env(env_extra)
     env["TVM_TIMELINE_OUTPUT_FILE"] = trace_path
+    cmd = ([sys.executable, runner_script] if runner_script
+           else [sys.executable, "-c", RUNNER])
     result = subprocess.run(
-        [sys.executable, "-c", RUNNER],
-        env=env, capture_output=True, text=True, timeout=120,
+        cmd, env=env, capture_output=True, text=True, timeout=120,
     )
     assert result.returncode == 0, f"subprocess exit {result.returncode}\n{result.stderr[-800:]}"
     if not os.path.exists(trace_path):
@@ -168,20 +177,26 @@ def test_bytecode_mode_works():
 
 def test_target_not_reached_no_file():
     """N=10, only 3 runs: target not reached, no trace file + stderr warning."""
+    # FC-6: 用唯一 tempfile 路径，运行前确认不存在，结束后断言仍不存在——
+    # 固定 /tmp 路径会被残留文件或并行测试掩盖（砚砚 FC-6）。
+    tmpdir = tempfile.mkdtemp(prefix="tl_target_unreached_")
+    trace_path = os.path.join(tmpdir, "trace.json")
+    assert not os.path.exists(trace_path), "precondition: trace must not exist"
     result = subprocess.run(
         [sys.executable, "-c", RUNNER],
         env=_subprocess_env({
             "TVM_TIMELINE_ENABLE": "1",
             "TVM_TIMELINE_CAPTURE_REQUEST": "10",
             "TEST_N_RUNS": "3",
-            "TVM_TIMELINE_OUTPUT_FILE": "/tmp/tl_target_unreached.json",
+            "TVM_TIMELINE_OUTPUT_FILE": trace_path,
         }),
         capture_output=True, text=True, timeout=120,
     )
     assert result.returncode == 0
     assert "target request was not reached" in result.stderr
-    if os.path.exists("/tmp/tl_target_unreached.json"):
-        os.unlink("/tmp/tl_target_unreached.json")
+    assert not os.path.exists(trace_path), (
+        f"trace file written despite target not reached: {trace_path}")
+    os.rmdir(tmpdir)
 
 
 RUNNER_CONCURRENT = r"""
@@ -210,24 +225,32 @@ mod = relax.transform.LegalizeOps()(mod)
 mod = instrument_timeline(mod)
 ex = relax.build(mod, target=tvm.target.Target("llvm"), exec_mode="compiled")
 dev = tvm.cpu()
-vm = relax.VirtualMachine(ex, dev)
-xt = tvm.runtime.empty((M, D), "float32", dev)
-xt.copyfrom(rng.standard_normal((M, D)).astype("float32"))
 
-# Two threads share the process (and thus TimelineRecorder::Global()), but each
-# has its own thread_local capture state. Thread A reaches target=2 and captures;
-# Thread B runs once (target=2 not reached) — B's events must NOT leak into the
-# trace just because A's capture is active.
+
+def make_vm():
+    vm = relax.VirtualMachine(ex, dev)
+    xt = tvm.runtime.empty((M, D), "float32", dev)
+    xt.copyfrom(rng.standard_normal((M, D)).astype("float32"))
+    return vm, xt
+
+
+# FC-1: 真正的双 VM 隔离——每线程独占一个 VirtualMachine 实例，各自维护独立的
+# req_index counter（共享不可变的 ex 是安全的）。thread A 跑到 req 2 触发
+# capture（在其线程上设 tl_capture_active=true）；thread B 只跑 1 次，
+# tl_capture_active 恒 false。thread_local 隔离确保 B 的 kernel 不泄漏进 trace。
+vm_a, xt_a = make_vm()
+vm_b, xt_b = make_vm()
+
 errors = []
-def worker(n_runs, label):
+def worker(vm, xt, n_runs, label):
     try:
         for _ in range(n_runs):
             vm["main"](xt)
     except Exception as e:
         errors.append((label, str(e)))
 
-ta = threading.Thread(target=worker, args=(2, "A"))  # reaches target=2
-tb = threading.Thread(target=worker, args=(1, "B"))  # does not reach target
+ta = threading.Thread(target=worker, args=(vm_a, xt_a, 2, "A"))  # reaches target=2
+tb = threading.Thread(target=worker, args=(vm_b, xt_b, 1, "B"))  # does not reach target
 ta.start(); tb.start()
 ta.join(); tb.join()
 if errors:
@@ -266,6 +289,43 @@ def test_concurrent_vms_no_leak():
     # events would leak in and kernel count would be 16.
     assert len(kernels) == 8, (
         f"expected 8 kernels (thread A only), got {len(kernels)} — possible cross-thread leak")
+
+
+def test_parallel_compiled_capture():
+    """FC-2: compiled + parallel_region — capture target req, assert parallel_region
+    events present and only from the target request (gate covers R-events, not just K)."""
+    trace = _run_trace({
+        "TVM_TIMELINE_ENABLE": "1",
+        "TVM_TIMELINE_CAPTURE_REQUEST": "1",
+        "TEST_N_RUNS": "3",
+        "TEST_EXEC_MODE": "compiled",
+    }, runner_script=PARALLEL_RUNNER)
+    assert trace is not None, "no trace file"
+    events = trace["traceEvents"]
+    inf = [e for e in events if e.get("cat") == "inference"]
+    assert len(inf) == 1 and inf[0]["args"]["request_index"] == 1
+    pr = [e for e in events if e.get("cat") == "parallel_region"]
+    assert len(pr) > 0, "no parallel_region events — model did not parallelize"
+    kernels = [e for e in events if e.get("cat") == "kernel"]
+    assert len(kernels) > 0, "no kernel events in compiled mode"
+    for e in events:
+        assert e["ts"] >= 0, f"negative ts: {e}"
+
+
+def test_parallel_bytecode_capture():
+    """FC-2: bytecode + parallel_region — same isolation as compiled mode."""
+    trace = _run_trace({
+        "TVM_TIMELINE_ENABLE": "1",
+        "TVM_TIMELINE_CAPTURE_REQUEST": "1",
+        "TEST_N_RUNS": "3",
+        "TEST_EXEC_MODE": "bytecode",
+    }, runner_script=PARALLEL_RUNNER)
+    assert trace is not None, "no trace file"
+    events = trace["traceEvents"]
+    inf = [e for e in events if e.get("cat") == "inference"]
+    assert len(inf) == 1 and inf[0]["args"]["request_index"] == 1
+    pr = [e for e in events if e.get("cat") == "parallel_region"]
+    assert len(pr) > 0, "no parallel_region events in bytecode mode"
 
 
 if __name__ == "__main__":
