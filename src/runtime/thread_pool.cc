@@ -36,7 +36,9 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cerrno>
 #include <cstdlib>
+#include <limits>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -602,8 +604,13 @@ struct TimelineConfig {
     const char* cr = std::getenv("TVM_TIMELINE_CAPTURE_REQUEST");
     if (cr != nullptr && cr[0] != '\0') {
       char* endp = nullptr;
+      errno = 0;
       long v = std::strtol(cr, &endp, 10);
-      if (endp != cr && *endp == '\0' && v > 0 && v <= 0x7fffffff) {
+      // FR-3: LLP64 (Windows MSVC) — long is 32-bit, strtol saturates at
+      // LONG_MAX == INT_MAX and sets errno=ERANGE on overflow. Without errno
+      // check, "99999999999" would pass v <= 0x7fffffff.
+      if (endp != cr && *endp == '\0' && errno != ERANGE &&
+          v > 0 && v <= std::numeric_limits<int>::max()) {
         capture_request = static_cast<int>(v);
       } else {
         std::cerr << "[TIMELINE] invalid TVM_TIMELINE_CAPTURE_REQUEST='" << cr

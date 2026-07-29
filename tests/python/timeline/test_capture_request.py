@@ -112,8 +112,12 @@ def test_directed_capture_req3_of5():
     inf = [e for e in events if e.get("cat") == "inference"]
     assert len(inf) == 1, f"expected 1 inference, got {len(inf)}"
     assert inf[0]["args"]["request_index"] == 3
+    # FR-1: strict count — RUNNER is N_OPS=4 (4 matmul + 4 relu = 8 kernels per
+    # request); target=3 means only req 3's kernels are recorded. >0 would pass
+    # even if the gate leaked and recorded all 5 requests' kernels (5*8=40).
     kernels = [e for e in events if e.get("cat") == "kernel"]
-    assert len(kernels) > 0, "no kernel events in compiled mode"
+    assert len(kernels) == 8, (
+        f"expected exactly 8 kernels (req 3 only: 4 matmul + 4 relu), got {len(kernels)}")
     for e in events:
         assert e["ts"] >= 0, f"negative ts: {e}"
 
@@ -159,6 +163,22 @@ def test_invalid_n_full_mode():
     assert trace is not None
     inf = [e for e in trace["traceEvents"] if e.get("cat") == "inference"]
     assert len(inf) == 3, f"invalid N should fall back; got {len(inf)}"
+
+
+def test_huge_n_falls_back_to_full():
+    """FR-3: N=99999999999 (> INT_MAX) — on LLP64 (Windows), strtol saturates at
+    LONG_MAX==INT_MAX and sets errno=ERANGE. Without errno check this would be
+    silently accepted; with the fix it falls back to full mode."""
+    trace = _run_trace({
+        "TVM_TIMELINE_ENABLE": "1",
+        "TVM_TIMELINE_CAPTURE_REQUEST": "99999999999",
+        "TEST_N_RUNS": "3",
+        "TEST_EXEC_MODE": "compiled",
+    })
+    assert trace is not None
+    inf = [e for e in trace["traceEvents"] if e.get("cat") == "inference"]
+    assert len(inf) == 3, (
+        f"huge N should fall back to full mode (errno=ERANGE), got {len(inf)} inference")
 
 
 def test_bytecode_mode_works():
@@ -234,23 +254,44 @@ def make_vm():
     return vm, xt
 
 
-# FC-1: 真正的双 VM 隔离——每线程独占一个 VirtualMachine 实例，各自维护独立的
-# req_index counter（共享不可变的 ex 是安全的）。thread A 跑到 req 2 触发
-# capture（在其线程上设 tl_capture_active=true）；thread B 只跑 1 次，
-# tl_capture_active 恒 false。thread_local 隔离确保 B 的 kernel 不泄漏进 trace。
+# FC-1: real dual-VM isolation — each thread owns a VirtualMachine with its own
+# req_index counter (sharing immutable ex is safe). thread A reaches req 2 and
+# triggers capture (sets tl_capture_active=true on A's thread); thread B's
+# tl_capture_active stays false. thread_local isolation ensures B's kernels
+# never leak into the trace.
 vm_a, xt_a = make_vm()
 vm_b, xt_b = make_vm()
 
 errors = []
-def worker(vm, xt, n_runs, label):
-    try:
-        for _ in range(n_runs):
-            vm["main"](xt)
-    except Exception as e:
-        errors.append((label, str(e)))
+# FR-2: Barrier guarantees B's single request executes inside A's capture scope.
+# worker_a runs target-1 (=1) warmup requests first, then both threads meet at
+# the barrier. On release, A runs its target-th request (capture window opens)
+# while B simultaneously runs its only request. Without this barrier, the GIL
+# or OS scheduler could serialize them — B finishing before A's capture window
+# opens, leaving the old global-state bug undetected (B wouldn't be recorded
+# because the global flag was already cleared).
+barrier = threading.Barrier(2, timeout=30)
 
-ta = threading.Thread(target=worker, args=(vm_a, xt_a, 2, "A"))  # reaches target=2
-tb = threading.Thread(target=worker, args=(vm_b, xt_b, 1, "B"))  # does not reach target
+
+def worker_a():
+    try:
+        vm_a["main"](xt_a)  # req 1 (not target)
+        barrier.wait()
+        vm_a["main"](xt_a)  # req 2 == target, capture window opens here
+    except Exception as e:
+        errors.append(("A", str(e)))
+
+
+def worker_b():
+    try:
+        barrier.wait()
+        vm_b["main"](xt_b)  # B's only request, inside A's capture window
+    except Exception as e:
+        errors.append(("B", str(e)))
+
+
+ta = threading.Thread(target=worker_a)
+tb = threading.Thread(target=worker_b)
 ta.start(); tb.start()
 ta.join(); tb.join()
 if errors:
@@ -305,9 +346,13 @@ def test_parallel_compiled_capture():
     inf = [e for e in events if e.get("cat") == "inference"]
     assert len(inf) == 1 and inf[0]["args"]["request_index"] == 1
     pr = [e for e in events if e.get("cat") == "parallel_region"]
-    assert len(pr) > 0, "no parallel_region events — model did not parallelize"
+    # FR-1: strict — _parallel_runner.padd is a single T.parallel loop, compiled
+    # to exactly 1 parallel_region per request; target=1 means only req 1 recorded.
+    assert len(pr) == 1, (
+        f"expected exactly 1 parallel_region (req 1 only), got {len(pr)}")
     kernels = [e for e in events if e.get("cat") == "kernel"]
-    assert len(kernels) > 0, "no kernel events in compiled mode"
+    assert len(kernels) == 1, (
+        f"expected exactly 1 kernel (req 1 only, single padd call), got {len(kernels)}")
     for e in events:
         assert e["ts"] >= 0, f"negative ts: {e}"
 
@@ -325,7 +370,10 @@ def test_parallel_bytecode_capture():
     inf = [e for e in events if e.get("cat") == "inference"]
     assert len(inf) == 1 and inf[0]["args"]["request_index"] == 1
     pr = [e for e in events if e.get("cat") == "parallel_region"]
-    assert len(pr) > 0, "no parallel_region events in bytecode mode"
+    # FR-1: strict — same model as compiled, bytecode emits identical event
+    # shape (1 parallel_region + 1 kernel for the single padd call).
+    assert len(pr) == 1, (
+        f"expected exactly 1 parallel_region (req 1 only), got {len(pr)}")
 
 
 if __name__ == "__main__":

@@ -29,7 +29,9 @@
 
 #include <optional>
 #include <thread>
+#include <cerrno>
 #include <cstdlib>
+#include <limits>
 
 // Timeline directed-capture hooks (defined in thread_pool.cc; same extern pattern
 // as TVMBackendTimelineBegin/End — no shared header to avoid polluting the runtime
@@ -476,8 +478,11 @@ class VirtualMachineImpl : public VirtualMachine {
       const char* e = std::getenv("TVM_TIMELINE_CAPTURE_REQUEST");
       if (e && e[0] != '\0') {
         char* endp = nullptr;
+        errno = 0;
         long v = std::strtol(e, &endp, 10);
-        if (endp != e && *endp == '\0' && v > 0 && v <= 0x7fffffff) return static_cast<int>(v);
+        // FR-3: errno check required on LLP64 (see thread_pool.cc).
+        if (endp != e && *endp == '\0' && errno != ERANGE &&
+            v > 0 && v <= std::numeric_limits<int>::max()) return static_cast<int>(v);
       }
       return -1;
     }();
