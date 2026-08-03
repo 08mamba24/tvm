@@ -6,9 +6,11 @@ test reads the JSON trace and asserts on its content.
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -431,6 +433,262 @@ def test_parallel_bytecode_capture():
         f"expected exactly 1 kernel (req 1 only, single padd call), got {len(kernels)}")
     for e in events:
         assert e["ts"] >= 0, f"negative ts: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Directed immediate-flush tests: TVM_TIMELINE_CAPTURE_REQUEST publishes the trace
+# at ExitCapture (the instant the target request completes), NOT only at static
+# teardown. Motivation: Tomcat / JNI / FFM hosts never reach static destruction, so
+# the trace must already be on disk by the time the Nth inference returns.
+# Design (converged with 砚砚 review):
+#   - dirty_ set on every event append; cleared on a successful WriteTraceLocked.
+#   - Each directed ExitCapture publishes a cumulative snapshot (multiple VMs each
+#     hitting target N all land in the file).
+#   - WriteTraceLocked copies events_ before rebasing/sorting (no in-place mutation
+#     → a second flush stays on one coordinate system).
+#   - Atomic publish: <path>.partial → fsync-grade flush → rename. External readers
+#     never see a half-written JSON.
+# ---------------------------------------------------------------------------
+
+RUNNER_FLUSH = r"""
+import os, sys, time
+import numpy as np
+import tvm
+from tvm import relax
+from tvm.relax import BlockBuilder
+from tvm.relax.timeline import instrument_timeline
+
+n_runs = int(os.environ.get("TEST_N_RUNS", "2"))
+
+N_OPS, M, D = 4, 32, 64
+rng = np.random.default_rng(0)
+bb = BlockBuilder()
+x = relax.Var("x", relax.TensorStructInfo((M, D), "float32"))
+ws = [(rng.standard_normal((D, D)) * 0.1).astype("float32") for _ in range(N_OPS)]
+with bb.function("main", [x]):
+    with bb.dataflow():
+        cur = x
+        for i in range(N_OPS):
+            cur = bb.emit(relax.op.matmul(cur, relax.const(ws[i])))
+            cur = bb.emit(relax.op.nn.relu(cur))
+        gv = bb.emit_output(cur)
+    bb.emit_func_output(gv)
+mod = bb.get()
+mod = relax.transform.LegalizeOps()(mod)
+mod = instrument_timeline(mod)
+ex = relax.build(mod, target=tvm.target.Target("llvm"), exec_mode="compiled")
+dev = tvm.cpu()
+vm = relax.VirtualMachine(ex, dev)
+xt = tvm.runtime.empty((M, D), "float32", dev)
+xt.copyfrom(rng.standard_normal((M, D)).astype("float32"))
+for _ in range(n_runs):
+    vm["main"](xt)
+# The directed flush for target N fired inside the last ExitCapture. Signal the
+# parent via a sync file (so it can inspect the trace WHILE we are still alive),
+# then wait for a proceed file before exiting normally (so the static destructor
+# runs and the parent can compare before/after).
+with open(os.environ["TL_SYNC_FILE"], "w") as _f:
+    _f.write("done")
+deadline = time.time() + 120
+while not os.path.exists(os.environ["TL_PROCEED_FILE"]):
+    if time.time() > deadline:
+        break
+    time.sleep(0.05)
+"""
+
+
+def _spawn_flush_runner(env_extra, n_runs=2):
+    tmpdir = tempfile.mkdtemp(prefix="tl_flush_")
+    trace_path = os.path.join(tmpdir, "trace.json")
+    sync_file = os.path.join(tmpdir, "sync")
+    proceed_file = os.path.join(tmpdir, "proceed")
+    env = _subprocess_env(dict(
+        env_extra, TEST_N_RUNS=str(n_runs), TVM_TIMELINE_OUTPUT_FILE=trace_path,
+        TL_SYNC_FILE=sync_file, TL_PROCEED_FILE=proceed_file))
+    proc = subprocess.Popen(
+        [sys.executable, "-c", RUNNER_FLUSH], env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return proc, trace_path, sync_file, proceed_file, tmpdir
+
+
+def _wait_sync_file(sync_file, timeout=120):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if os.path.exists(sync_file):
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def test_directed_flush_before_exit():
+    """Core: the trace JSON exists WHILE the process is still alive — the directed
+    flush fires at ExitCapture, not at static teardown. This is the fix for long-
+    running hosts (Tomcat/JNI) that never exit."""
+    proc, trace_path, sync_file, proceed_file, tmpdir = _spawn_flush_runner(
+        {"TVM_TIMELINE_ENABLE": "1", "TVM_TIMELINE_CAPTURE_REQUEST": "2"}, n_runs=2)
+    try:
+        if not _wait_sync_file(sync_file, timeout=120):
+            proc.terminate()
+            _, err = proc.communicate(timeout=10)
+            pytest.fail(
+                f"never saw sync file (exited={proc.poll() is not None})\n{err[:1200]}")
+        assert proc.poll() is None, "subprocess exited before we could inspect the file"
+        assert os.path.exists(trace_path), (
+            "trace not published before exit — directed flush did not fire at ExitCapture")
+        with open(trace_path) as f:
+            trace = json.load(f)
+        inf = [e for e in trace["traceEvents"] if e.get("cat") == "inference"]
+        assert len(inf) == 1 and inf[0]["args"]["request_index"] == 2
+        kernels = [e for e in trace["traceEvents"] if e.get("cat") == "kernel"]
+        assert len(kernels) == 8, f"expected 8 kernels (N_OPS=4), got {len(kernels)}"
+        for e in trace["traceEvents"]:
+            assert e["ts"] >= 0, f"negative ts: {e}"
+    finally:
+        if proc.poll() is None:
+            try:
+                open(proceed_file, "w").close()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_directed_no_double_write():
+    """After a successful directed flush, dirty_ is cleared so the destructor does
+    NOT re-write. Verified by identical file bytes before/after normal exit and
+    exactly one '[TIMELINE] wrote' log line."""
+    proc, trace_path, sync_file, proceed_file, tmpdir = _spawn_flush_runner(
+        {"TVM_TIMELINE_ENABLE": "1", "TVM_TIMELINE_CAPTURE_REQUEST": "2"}, n_runs=2)
+    try:
+        assert _wait_sync_file(sync_file, timeout=120), "never saw sync file"
+        with open(trace_path, "rb") as f:
+            before = f.read()
+        try:
+            open(proceed_file, "w").close()
+        except OSError:
+            pass
+        proc.wait(timeout=30)
+        stderr = proc.stderr.read()
+        with open(trace_path, "rb") as f:
+            after = f.read()
+        assert before == after, "destructor re-wrote the file after a successful flush"
+        wrote_count = stderr.count("[TIMELINE] wrote")
+        assert wrote_count == 1, (
+            f"expected exactly 1 'wrote' log, got {wrote_count}\nstderr:\n{stderr[:1200]}")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_flush_fail_destructor_retry():
+    """Output path unwritable: the directed flush fails (cannot open .partial) →
+    dirty_ stays true → the destructor retries at teardown. Assert >= 2 'cannot open'
+    logs (ExitCapture flush attempt + destructor fallback). Uses a regular file as
+    the parent directory of the output path (ENOTDIR), per 砚砚 review."""
+    tmpdir = tempfile.mkdtemp(prefix="tl_flushfail_")
+    blocker = os.path.join(tmpdir, "blocker")
+    with open(blocker, "w") as f:
+        f.write("x")  # regular file — parent-dir open yields ENOTDIR
+    trace_path = os.path.join(blocker, "trace.json")
+    result = subprocess.run(
+        [sys.executable, "-c", RUNNER],
+        env=_subprocess_env({
+            "TVM_TIMELINE_ENABLE": "1", "TVM_TIMELINE_CAPTURE_REQUEST": "2",
+            "TEST_N_RUNS": "2", "TVM_TIMELINE_OUTPUT_FILE": trace_path,
+        }),
+        capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, f"runner failed:\n{result.stderr[:1200]}"
+    cannot = result.stderr.count("cannot open")
+    assert cannot >= 2, (
+        f"expected >= 2 'cannot open' (ExitCapture flush + destructor retry), got "
+        f"{cannot}\nstderr:\n{result.stderr[:1200]}")
+    assert not os.path.exists(trace_path)
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+RUNNER_MULTI_VM = r"""
+import numpy as np
+import tvm
+from tvm import relax
+from tvm.relax import BlockBuilder
+from tvm.relax.timeline import instrument_timeline
+
+N_OPS, M, D = 2, 32, 64
+rng = np.random.default_rng(0)
+bb = BlockBuilder()
+x = relax.Var("x", relax.TensorStructInfo((M, D), "float32"))
+ws = [(rng.standard_normal((D, D)) * 0.1).astype("float32") for _ in range(N_OPS)]
+with bb.function("main", [x]):
+    with bb.dataflow():
+        cur = x
+        for i in range(N_OPS):
+            cur = bb.emit(relax.op.matmul(cur, relax.const(ws[i])))
+            cur = bb.emit(relax.op.nn.relu(cur))
+        gv = bb.emit_output(cur)
+    bb.emit_func_output(gv)
+mod = bb.get()
+mod = relax.transform.LegalizeOps()(mod)
+mod = instrument_timeline(mod)
+ex = relax.build(mod, target=tvm.target.Target("llvm"), exec_mode="compiled")
+dev = tvm.cpu()
+
+
+def make_vm():
+    vm = relax.VirtualMachine(ex, dev)
+    xt = tvm.runtime.empty((M, D), "float32", dev)
+    xt.copyfrom(rng.standard_normal((M, D)).astype("float32"))
+    return vm, xt
+
+
+# Two VM instances; each has its own per-VM request counter (vm.cc member), so
+# CAPTURE_REQUEST=1 targets each VM's first main call independently. VM-A's
+# ExitCapture publishes A's events; VM-B's ExitCapture publishes the cumulative
+# A+B snapshot. The final file must contain BOTH VMs' events. A one-shot
+# directed_flush_done_ flag would set done=true at VM-A's flush and skip the
+# destructor — if VM-B's ExitCapture ever didn't fire before exit, B's appended
+# events would be lost. dirty_ (set on every append) guarantees the destructor
+# always publishes unwritten data. This test also guards the snapshot-rebase fix:
+# mutating events_ in place would corrupt timestamps on the second flush (two
+# coordinate systems coexisting).
+vm_a, xt_a = make_vm()
+vm_b, xt_b = make_vm()
+vm_a["main"](xt_a)
+vm_b["main"](xt_b)
+"""
+
+
+def test_multi_vm_directed_flush():
+    """Two VMs each hit target (CAPTURE_REQUEST=1): the cumulative snapshot must
+    contain both VMs' events. Guards dirty_ semantics (destructor publishes unwritten
+    appends) and snapshot-rebase correctness (no in-place timestamp mutation)."""
+    tmpdir = tempfile.mkdtemp(prefix="tl_multi_")
+    trace_path = os.path.join(tmpdir, "trace.json")
+    result = subprocess.run(
+        [sys.executable, "-c", RUNNER_MULTI_VM],
+        env=_subprocess_env({
+            "TVM_TIMELINE_ENABLE": "1", "TVM_TIMELINE_CAPTURE_REQUEST": "1",
+            "TVM_TIMELINE_OUTPUT_FILE": trace_path,
+        }),
+        capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, f"multi-vm runner failed:\n{result.stderr[:1200]}"
+    assert os.path.exists(trace_path), "no trace file"
+    with open(trace_path) as f:
+        trace = json.load(f)
+    events = trace["traceEvents"]
+    inf = [e for e in events if e.get("cat") == "inference"]
+    assert len(inf) == 2, f"expected 2 inference (one per VM), got {len(inf)}"
+    kernels = [e for e in events if e.get("cat") == "kernel"]
+    # N_OPS=2: 2 matmul + 2 relu = 4 kernels/VM x 2 VMs = 8
+    assert len(kernels) == 8, (
+        f"expected 8 kernels (2 VMs x 4), got {len(kernels)} — second flush may have "
+        f"lost VM-A's events")
+    for e in events:
+        assert e["ts"] >= 0, f"negative ts (snapshot rebase corruption): {e}"
+    shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 if __name__ == "__main__":

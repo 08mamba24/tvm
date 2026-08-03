@@ -37,6 +37,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <cstring>
@@ -704,6 +705,7 @@ class TimelineRecorder {
     events_.push_back({key, -1, tid, std::chrono::duration<double, std::micro>(t0 - epoch_).count(),
                        std::chrono::duration<double, std::micro>(t1 - t0).count(), num_task,
                        static_cast<int8_t>(phase), "parallel_region"});
+    dirty_ = true;
   }
 
   // Kernel-track event from TVMBackendTimelineBegin/End instrumentation. The name is a
@@ -731,6 +733,7 @@ class TimelineRecorder {
                        std::chrono::duration<double, std::micro>(t0 - epoch_).count(),
                        std::chrono::duration<double, std::micro>(t1 - t0).count(), -1, 0,
                         "kernel"});
+    dirty_ = true;
   }
 
   // Directed-capture API: called by the VM layer around the Nth `main` invocation.
@@ -759,49 +762,91 @@ class TimelineRecorder {
                          std::chrono::duration<double, std::micro>(tl_capture_start - epoch_).count(),
                          std::chrono::duration<double, std::micro>(now - tl_capture_start).count(),
                          -1, 0, "inference", tl_capture_req_index});
+      dirty_ = true;
     } else {
       ++dropped_;
     }
     tl_capture_active = false;
+    // Directed-capture immediate publish: the target request just completed, so all
+    // its kernel / parallel_region / inference events are already in events_. Long-
+    // running hosts (Tomcat/JNI/FFM) never reach static teardown — publish now so the
+    // trace is visible without stopping the service. WriteTraceLocked runs under mu_
+    // (already held here), publishes a snapshot without mutating events_, and on
+    // success clears dirty_ so the destructor does not redundantly re-write.
+    if (GetTimelineConfig().capture_request > 0) {
+      WriteTraceLocked();
+    }
   }
 
   ~TimelineRecorder() {
     std::lock_guard<std::mutex> lock(mu_);
-    if (events_.empty()) {
-      if (GetTimelineConfig().capture_request > 0) {
+    if (!dirty_) {
+      // Already published (events_ on disk, no appends since last WriteTraceLocked) or
+      // nothing ever happened. Warn only when directed capture was configured but the
+      // target request was never reached (events_ still empty at teardown).
+      if (events_.empty() && GetTimelineConfig().capture_request > 0) {
         std::cerr << "[TIMELINE] TVM_TIMELINE_CAPTURE_REQUEST="
                   << GetTimelineConfig().capture_request
                   << " but target request was not reached; no trace written" << std::endl;
       }
       return;
     }
-    // Negative-ts fix: the epoch is set by whichever event first reaches Record, which
-    // can be an inner parallel_region that finished before the outer kernel that started
-    // earlier — leaving the outer event with ts < 0 (Perfetto drops them). Rebase all
-    // events to the earliest start time and stable-sort so viewers see a clean timeline.
-    double min_ts = events_[0].ts_us;
-    for (const auto& ev : events_) {
+    // dirty: unwritten appends exist (full mode throughout, or a directed flush that
+    // failed and left events_ unpublished). Final publish at static teardown.
+    WriteTraceLocked();
+  }
+
+ private:
+  // Publish events_ as a Chrome-Trace JSON to cfg.path. MUST be called under mu_.
+  // Returns true on success (clears dirty_), false on failure (keeps dirty_ so the
+  // destructor retries at static teardown).
+  //
+  // Snapshot semantics (砚砚 review #2): the canonical events_ is NEVER mutated —
+  // rebase + stable_sort run on a local copy, so events_ stays on its original epoch
+  // and later appends + re-flushes (multiple VMs each hitting their target N) keep one
+  // consistent timeline. The old destructor mutated events_ in place, which corrupts a
+  // second flush (rebased-old + raw-new timestamps coexist).
+  //
+  // Atomic publish (砚砚 review #3): write <path>.partial, flush+verify, then rename
+  // onto <path>. An external observer polling the path (Tomcat host) never sees a
+  // half-written JSON; it sees either the previous complete trace or the new one.
+  bool WriteTraceLocked() {
+    if (events_.empty()) {
+      dirty_ = false;
+      return true;
+    }
+    const TimelineConfig& cfg = GetTimelineConfig();
+    std::vector<TimelineEvent> snap = events_;  // copy — canonical events_ untouched
+    // Negative-ts fix on the snapshot only: the epoch is set by whichever event first
+    // reaches Record, which can be an inner parallel_region that finished before the
+    // outer kernel that started earlier — leaving the outer event with ts < 0 (Perfetto
+    // drops them). Rebase all events to the earliest start time and stable-sort.
+    double min_ts = snap[0].ts_us;
+    for (const auto& ev : snap) {
       if (ev.ts_us < min_ts) min_ts = ev.ts_us;
     }
     if (min_ts < 0.0) {
-      for (auto& ev : events_) ev.ts_us -= min_ts;
+      for (auto& ev : snap) ev.ts_us -= min_ts;
     }
-    std::stable_sort(events_.begin(), events_.end(),
+    std::stable_sort(snap.begin(), snap.end(),
                      [](const TimelineEvent& a, const TimelineEvent& b) {
                        return a.ts_us < b.ts_us;
                      });
-    const TimelineConfig& cfg = GetTimelineConfig();
-    std::ofstream os(cfg.path);
+    // Atomic publish: temp file in the same directory (same filesystem → POSIX rename
+    // is atomic). Windows std::rename fails if the target exists; acceptable for this
+    // Linux/macOS-targeted debugging tool.
+    std::string tmp_path = cfg.path + ".partial";
+    std::ofstream os(tmp_path);
     if (!os) {
-      std::cerr << "[TIMELINE] cannot open " << cfg.path << std::endl;
-      return;
+      std::cerr << "[TIMELINE] cannot open " << tmp_path << std::endl;
+      return false;
     }
     os << std::fixed << std::setprecision(3);
     os << "{\"displayTimeUnit\":\"ms\",\"traceEvents\":[";
     static const char* kPhase[] = {"steady", "warmup_full", "warmup_min"};
     bool first = true;
     const RegionInfo kUnknown;  // defensive only: Record always registers the region
-    for (const TimelineEvent& ev : events_) {
+    for (const TimelineEvent& ev : snap) {
       if (!first) os << ",";
       first = false;
       if (ev.request_index >= 0) {  // cat=inference root event spanning one main call
@@ -826,13 +871,27 @@ class TimelineRecorder {
          << std::dec << "\"}}";
     }
     os << "\n]}\n";
-    // std::cerr, not LOG(INFO): logging infra may already be torn down at static exit.
-    std::cerr << "[TIMELINE] wrote " << events_.size() << " events to " << cfg.path;
+    os.flush();  // force write; check state before declaring success
+    if (!os) {
+      // std::cerr, not LOG(INFO): at static teardown the logging infra may be gone.
+      std::cerr << "[TIMELINE] write failed to " << tmp_path << std::endl;
+      os.close();
+      std::remove(tmp_path.c_str());
+      return false;
+    }
+    os.close();
+    if (std::rename(tmp_path.c_str(), cfg.path.c_str()) != 0) {
+      std::cerr << "[TIMELINE] cannot rename " << tmp_path << " -> " << cfg.path << std::endl;
+      std::remove(tmp_path.c_str());
+      return false;
+    }
+    std::cerr << "[TIMELINE] wrote " << snap.size() << " events to " << cfg.path;
     if (dropped_ > 0) std::cerr << " (dropped " << dropped_ << " over TVM_TIMELINE_MAX_EVENTS)";
     std::cerr << std::endl;
+    dirty_ = false;
+    return true;
   }
 
- private:
   std::mutex mu_;
   std::vector<TimelineEvent> events_;
   std::unordered_map<uintptr_t, RegionInfo> regions_;
@@ -843,6 +902,12 @@ class TimelineRecorder {
   std::chrono::steady_clock::time_point epoch_;
   bool epoch_valid_ = false;
   uint64_t dropped_ = 0;
+  // True when events_ has appends since the last successful WriteTraceLocked. Set on
+  // every Record/RecordNamed/ExitCapture push; cleared on a successful publish. The
+  // destructor uses this (not a one-shot "done" bool) so that: (a) a failed early flush
+  // is retried at teardown, and (b) in multi-VM directed mode, VM-B's appends after
+  // VM-A's flush are still published (砚砚 review #1 — a global done flag would skip).
+  bool dirty_ = false;
 };
 
 // Per-thread stack of open TVMBackendTimelineBegin frames. Kernels are entered and
