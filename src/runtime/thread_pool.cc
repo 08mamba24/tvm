@@ -39,6 +39,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <limits>
 #include <cstring>
 #include <fstream>
@@ -581,8 +582,12 @@ thread_local std::unordered_map<uintptr_t, ParallelRegionProfile> g_region_profi
 // gaps BETWEEN regions and the adaptive per-region decision are both visible.
 // Env vocabulary matches 0.9:
 //   TVM_TIMELINE_ENABLE=1        turn on (default off: cost is one cached bool)
-//   TVM_TIMELINE_OUTPUT_FILE=f   output path (default tvm_timeline.json), written
-//                                once at process exit
+//   TVM_TIMELINE_OUTPUT_FILE=f   output path (default tvm_timeline.json). Full mode:
+//                                written at process exit (static destructor). Directed
+//                                mode (CAPTURE_REQUEST): published immediately after
+//                                the target request completes (ExitCapture), so long-
+//                                running hosts see it without exiting; retried at exit
+//                                only if the early publish failed.
 //   TVM_TIMELINE_MAX_EVENTS=n    recording cap (default 1e6); excess is counted
 //                                and reported, never silently dropped
 //   TVM_TIMELINE_CAPTURE_REQUEST=N  1-based: only record the Nth `main` inference
@@ -807,9 +812,12 @@ class TimelineRecorder {
   // consistent timeline. The old destructor mutated events_ in place, which corrupts a
   // second flush (rebased-old + raw-new timestamps coexist).
   //
-  // Atomic publish (砚砚 review #3): write <path>.partial, flush+verify, then rename
-  // onto <path>. An external observer polling the path (Tomcat host) never sees a
-  // half-written JSON; it sees either the previous complete trace or the new one.
+  // Atomic publish (砚砚 review #3): write <path>.partial, close+verify, then rename
+  // onto <path> (std::filesystem::rename = portable atomic replace). An external
+  // observer polling the path (Tomcat host) never sees a half-written JSON; it sees
+  // either the previous complete trace or the new one. NB: ofstream::close flushes the
+  // user buffer only (NOT fsync) — the guarantee is visibility to concurrent readers
+  // via the atomic rename, not power-loss durability.
   bool WriteTraceLocked() {
     if (events_.empty()) {
       dirty_ = false;
@@ -871,17 +879,21 @@ class TimelineRecorder {
          << std::dec << "\"}}";
     }
     os << "\n]}\n";
-    os.flush();  // force write; check state before declaring success
+    os.close();  // close flushes; a failure here (e.g. disk full mid-flush) sets badbit
     if (!os) {
       // std::cerr, not LOG(INFO): at static teardown the logging infra may be gone.
       std::cerr << "[TIMELINE] write failed to " << tmp_path << std::endl;
-      os.close();
       std::remove(tmp_path.c_str());
       return false;
     }
-    os.close();
-    if (std::rename(tmp_path.c_str(), cfg.path.c_str()) != 0) {
-      std::cerr << "[TIMELINE] cannot rename " << tmp_path << " -> " << cfg.path << std::endl;
+    // Atomic replace (portable): std::filesystem::rename replaces an existing target
+    // on both POSIX and Windows. std::rename (the C API) fails if the target exists on
+    // Windows, which would leave a stale trace after the second directed flush.
+    std::error_code rename_ec;
+    std::filesystem::rename(tmp_path, cfg.path, rename_ec);
+    if (rename_ec) {
+      std::cerr << "[TIMELINE] cannot rename " << tmp_path << " -> " << cfg.path << ": "
+                << rename_ec.message() << std::endl;
       std::remove(tmp_path.c_str());
       return false;
     }

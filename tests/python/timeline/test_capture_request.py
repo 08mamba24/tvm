@@ -1,9 +1,11 @@
-"""Tests for TVM_TIMELINE_CAPTURE_REQUEST directed capture + negative-ts fix.
+"""Tests for TVM_TIMELINE_CAPTURE_REQUEST directed capture + negative-ts fix +
+directed immediate-flush (trace published at ExitCapture, not only at exit).
 
-Each test spawns a subprocess that runs the model and exits (the trace is
-written at process exit by TimelineRecorder's static destructor). The parent
-test reads the JSON trace and asserts on its content.
-"""
+Most tests spawn a subprocess that runs the model and exits; the trace is written
+either at process exit (full mode / destructor fallback) or immediately after the
+target request (directed mode — ExitCapture publish). The parent reads the JSON
+trace and asserts on its content. The flush tests use a sync-file handshake so the
+parent can inspect the file WHILE the subprocess is still alive."""
 import json
 import os
 import shutil
@@ -446,8 +448,10 @@ def test_parallel_bytecode_capture():
 #     hitting target N all land in the file).
 #   - WriteTraceLocked copies events_ before rebasing/sorting (no in-place mutation
 #     → a second flush stays on one coordinate system).
-#   - Atomic publish: <path>.partial → fsync-grade flush → rename. External readers
-#     never see a half-written JSON.
+#   - Atomic publish: <path>.partial → close+verify → std::filesystem::rename
+#     (portable atomic replace). External readers never see a half-written JSON.
+#     ofstream::close flushes the user buffer only (NOT fsync) — the guarantee is
+#     visibility to concurrent readers, not power-loss durability.
 # ---------------------------------------------------------------------------
 
 RUNNER_FLUSH = r"""
@@ -586,9 +590,10 @@ def test_directed_no_double_write():
 
 def test_flush_fail_destructor_retry():
     """Output path unwritable: the directed flush fails (cannot open .partial) →
-    dirty_ stays true → the destructor retries at teardown. Assert >= 2 'cannot open'
-    logs (ExitCapture flush attempt + destructor fallback). Uses a regular file as
-    the parent directory of the output path (ENOTDIR), per 砚砚 review."""
+    dirty_ stays true → the destructor retries at teardown. Exactly 2 'cannot open'
+    logs: one from ExitCapture's directed publish, one from the destructor fallback.
+    Uses a regular file as the parent directory of the output path (ENOTDIR), per
+    砚砚 review. ==2 (not >=2) so an unexpected third write is caught."""
     tmpdir = tempfile.mkdtemp(prefix="tl_flushfail_")
     blocker = os.path.join(tmpdir, "blocker")
     with open(blocker, "w") as f:
@@ -603,8 +608,8 @@ def test_flush_fail_destructor_retry():
         capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, f"runner failed:\n{result.stderr[:1200]}"
     cannot = result.stderr.count("cannot open")
-    assert cannot >= 2, (
-        f"expected >= 2 'cannot open' (ExitCapture flush + destructor retry), got "
+    assert cannot == 2, (
+        f"expected exactly 2 'cannot open' (ExitCapture flush + destructor retry), got "
         f"{cannot}\nstderr:\n{result.stderr[:1200]}")
     assert not os.path.exists(trace_path)
     shutil.rmtree(tmpdir, ignore_errors=True)
@@ -662,9 +667,14 @@ vm_b["main"](xt_b)
 
 
 def test_multi_vm_directed_flush():
-    """Two VMs each hit target (CAPTURE_REQUEST=1): the cumulative snapshot must
-    contain both VMs' events. Guards dirty_ semantics (destructor publishes unwritten
-    appends) and snapshot-rebase correctness (no in-place timestamp mutation)."""
+    """Two VMs each hit target (CAPTURE_REQUEST=1): VM-A's ExitCapture publishes A's
+    events, VM-B's ExitCapture publishes the cumulative A+B snapshot. The file must
+    contain BOTH VMs' events and all timestamps must be non-negative. This guards the
+    snapshot-rebase fix (in-place mutation would corrupt ts on the 2nd flush) and the
+    cumulative-snapshot contract (each flush writes the full events_ so far). NB: it
+    does NOT directly exercise the destructor-publishes-tail path — for that, the
+    full-mode tests + code inspection of dirty_ (set on every Record/ExitCapture push,
+    cleared only on successful WriteTraceLocked) are the guarantee."""
     tmpdir = tempfile.mkdtemp(prefix="tl_multi_")
     trace_path = os.path.join(tmpdir, "trace.json")
     result = subprocess.run(
