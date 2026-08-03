@@ -32,6 +32,15 @@
 #if TVM_THREADPOOL_USE_OPENMP
 #include <omp.h>
 #endif
+// timeline atomic publish uses MoveFileExA on Windows (std::rename fails if the
+// target exists there). NOMINMAX avoids the min/max macro pollution that breaks
+// std::numeric_limits / std::min usage below.
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -39,7 +48,6 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
-#include <filesystem>
 #include <limits>
 #include <cstring>
 #include <fstream>
@@ -813,7 +821,8 @@ class TimelineRecorder {
   // second flush (rebased-old + raw-new timestamps coexist).
   //
   // Atomic publish (砚砚 review #3): write <path>.partial, close+verify, then rename
-  // onto <path> (std::filesystem::rename = portable atomic replace). An external
+  // onto <path> (platform atomic replace: std::rename on POSIX, MoveFileExA on
+  // Windows — no <filesystem> to keep GCC 7.1 toolchain support, FR-1 砚砚 R2). An external
   // observer polling the path (Tomcat host) never sees a half-written JSON; it sees
   // either the previous complete trace or the new one. NB: ofstream::close flushes the
   // user buffer only (NOT fsync) — the guarantee is visibility to concurrent readers
@@ -840,9 +849,9 @@ class TimelineRecorder {
                      [](const TimelineEvent& a, const TimelineEvent& b) {
                        return a.ts_us < b.ts_us;
                      });
-    // Atomic publish: temp file in the same directory (same filesystem → POSIX rename
-    // is atomic). Windows std::rename fails if the target exists; acceptable for this
-    // Linux/macOS-targeted debugging tool.
+    // Atomic publish: temp file in the same directory so POSIX std::rename is
+    // same-filesystem atomic. The platform rename (below) replaces an existing target
+    // on both POSIX and Windows.
     std::string tmp_path = cfg.path + ".partial";
     std::ofstream os(tmp_path);
     if (!os) {
@@ -886,14 +895,18 @@ class TimelineRecorder {
       std::remove(tmp_path.c_str());
       return false;
     }
-    // Atomic replace (portable): std::filesystem::rename replaces an existing target
-    // on both POSIX and Windows. std::rename (the C API) fails if the target exists on
-    // Windows, which would leave a stale trace after the second directed flush.
-    std::error_code rename_ec;
-    std::filesystem::rename(tmp_path, cfg.path, rename_ec);
-    if (rename_ec) {
-      std::cerr << "[TIMELINE] cannot rename " << tmp_path << " -> " << cfg.path << ": "
-                << rename_ec.message() << std::endl;
+    // Atomic replace (platform-specific, no <filesystem> — TVM supports GCC 7.1 whose
+    // libstdc++ lacks std::filesystem without -lstdc++fs; FR-1 砚砚 R2 review).
+    //   POSIX: std::rename replaces atomically (same-dir, same-filesystem).
+    //   Windows: std::rename fails if the target exists; MoveFileExA with
+    //   MOVEFILE_REPLACE_EXISTING is the atomic replace. Without it the second
+    //   directed flush would silently leave a stale trace.
+#if defined(_WIN32)
+    if (!MoveFileExA(tmp_path.c_str(), cfg.path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+#else
+    if (std::rename(tmp_path.c_str(), cfg.path.c_str()) != 0) {
+#endif
+      std::cerr << "[TIMELINE] cannot rename " << tmp_path << " -> " << cfg.path << std::endl;
       std::remove(tmp_path.c_str());
       return false;
     }

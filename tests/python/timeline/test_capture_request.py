@@ -448,10 +448,11 @@ def test_parallel_bytecode_capture():
 #     hitting target N all land in the file).
 #   - WriteTraceLocked copies events_ before rebasing/sorting (no in-place mutation
 #     → a second flush stays on one coordinate system).
-#   - Atomic publish: <path>.partial → close+verify → std::filesystem::rename
-#     (portable atomic replace). External readers never see a half-written JSON.
-#     ofstream::close flushes the user buffer only (NOT fsync) — the guarantee is
-#     visibility to concurrent readers, not power-loss durability.
+#   - Atomic publish: <path>.partial → close+verify → platform atomic replace
+#     (std::rename on POSIX, MoveFileExA on Windows — no <filesystem>, GCC 7.1 safe).
+#     External readers never see a half-written JSON. ofstream::close flushes the
+#     user buffer only (NOT fsync) — visibility to concurrent readers, not power-loss
+#     durability.
 # ---------------------------------------------------------------------------
 
 RUNNER_FLUSH = r"""
