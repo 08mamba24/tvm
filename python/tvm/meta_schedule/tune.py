@@ -16,6 +16,7 @@
 # under the License.
 """The core tuning API"""
 import logging
+import math
 import os
 from typing import List, Optional
 
@@ -116,6 +117,128 @@ def _filter_tuned_tasks(tasks, task_weights, database):
             kept_tasks.append(task)
             kept_weights.append(weight)
     return kept_tasks, kept_weights, skipped
+
+
+# Opt-in floor on a task's estimated FLOP (mirrors TVM_MS_SKIP_TUNED above):
+# unset/empty means byte-for-byte default behavior, i.e. every task is tuned.
+_MIN_FLOP_ENV = "TVM_MS_MIN_FLOP"
+
+
+def _min_flop_threshold() -> Optional[float]:
+    raw = os.environ.get(_MIN_FLOP_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("[ms-min-flop] ignoring invalid %s=%r (expect a number)", _MIN_FLOP_ENV, raw)
+        return None
+    # `nan` parses and `nan <= 0` is False, so guard finiteness explicitly -- otherwise
+    # every later `flop < nan` is False and the knob silently becomes a no-op.
+    if not math.isfinite(value) or value <= 0:
+        logger.warning(
+            "[ms-min-flop] ignoring %s=%r (expect a finite positive number)", _MIN_FLOP_ENV, raw
+        )
+        return None
+    return value
+
+
+def _filter_untunable_tasks(tasks, task_weights, flop_prefilter):
+    """Split off tasks whose design space is a single point, to be measured once.
+
+    The decisive predicate is "the design space holds exactly one schedule and it
+    carries zero sampling decisions". Search cannot improve such a task: evolutionary
+    search spends a whole population replaying identical traces to rediscover the point
+    it started from, then spins through `num_empty_iters_before_early_stop` full-cost
+    empty rounds before giving up. On a large injective fan-in chain (AutoInline folds
+    the chain into its concatenate consumer) one replay alone can take seconds, which is
+    how a FLOP=860 kernel turns into hours of tuning.
+
+    Such a task is NOT dropped. A single point is still a real schedule -- typically
+    compute_inline plus meta_schedule.parallel / .vectorize, which the postprocs turn
+    into a fused parallel+vectorized loop -- and MetaScheduleApplyDatabase leaves the
+    original serial PrimFunc in place when the database has no record. It is returned
+    separately so the caller can measure it exactly once (one build+run) and still land
+    a record.
+
+    FLOP is only a cheap PREFILTER: at or above `flop_prefilter` a task is kept outright
+    and no design space is built. FLOP alone is not a safe criterion -- reduction kernels
+    (sum / softmax) and small matmuls have tiny FLOP yet a real search space.
+
+    Anything that cannot be evaluated is kept, so an analysis failure never silently
+    diverts real compute.
+
+    Returns (kept, kept_weights, one_shot, one_shot_weights, rescued).
+    """
+    from tvm.tir.analysis import estimate_tir_flops  # pylint: disable=import-outside-toplevel
+
+    kept_tasks, kept_weights = [], []
+    one_shot_tasks, one_shot_weights, rescued = [], [], []
+    for task, weight in zip(tasks, task_weights):
+        try:
+            flop = estimate_tir_flops(task.mod)
+        except Exception as err:  # pylint: disable=broad-except
+            logger.warning(
+                "[ms-skip-untunable] cannot estimate FLOP for %s (%s: %s); keeping it",
+                task.task_name,
+                type(err).__name__,
+                err,
+            )
+            flop = float("inf")
+        if flop < flop_prefilter:
+            try:
+                # A CLONE, not task.generate_design_space(): PostOrderApply's
+                # GenerateDesignSpace does ForkSeed(&this->rand_state_)
+                # (post_order_apply.cc:54, utils.h:240) and TaskSchedulerNode::Tune
+                # regenerates the space itself, so probing the live generator would
+                # shift every sampling decision the real run makes. Clone() copies
+                # rand_state_, so the probe sees what the live generator would see and
+                # leaves it untouched.
+                space = task.space_generator.clone().generate_design_space(task.mod)
+            except Exception as err:  # pylint: disable=broad-except
+                logger.warning(
+                    "[ms-skip-untunable] cannot build design space for %s (%s: %s); keeping it",
+                    task.task_name,
+                    type(err).__name__,
+                    err,
+                )
+                space = None
+            if space is not None:
+                decisions = sum(len(sch.trace.decisions) for sch in space)
+                if not space:
+                    # PostOrderApply can legitimately return [] (tensor-core rules,
+                    # custom rules). Pre-patch that ICHECK-failed loudly in
+                    # EvolutionarySearch::PreTuning; do not convert it into a silent drop.
+                    logger.warning(
+                        "[ms-skip-untunable] %s has an EMPTY design space; keeping it",
+                        task.task_name,
+                    )
+                elif decisions == 0 and len(space) > 1:
+                    # Several discrete points built from deterministic instructions only
+                    # (e.g. meta_schedule.cuda.layout_transform's tile-size variants).
+                    # That is a real search space even with zero sampling decisions.
+                    logger.warning(
+                        "[ms-skip-untunable] %s has %d discrete design points and no "
+                        "sampling decisions; keeping it",
+                        task.task_name,
+                        len(space),
+                    )
+                elif decisions == 0:
+                    # The genuine single point. It is NOT a no-op schedule: an injective
+                    # chain still carries compute_inline + meta_schedule.parallel /
+                    # .vectorize, which the postprocs turn into a fused parallel+vectorized
+                    # loop (measured 1.73x over the untuned lowering). Dropping it outright
+                    # would forfeit that, because ApplyDatabase leaves the original serial
+                    # PrimFunc in place when there is no record. So: measure it ONCE
+                    # instead of searching it -- one build+run, not hours.
+                    one_shot_tasks.append(task)
+                    one_shot_weights.append(weight)
+                    continue
+                else:
+                    rescued.append((str(task.task_name), flop, decisions))
+        kept_tasks.append(task)
+        kept_weights.append(weight)
+    return kept_tasks, kept_weights, one_shot_tasks, one_shot_weights, rescued
 
 
 _DRIFT_CUT_ENV = "TVM_MS_DRIFT_CUT"
@@ -296,6 +419,40 @@ def tune_tasks(
         )
         if not tasks:
             return database
+    min_flop = _min_flop_threshold()
+    one_shot_tasks, one_shot_weights = [], []
+    if min_flop is not None:
+        (
+            tasks,
+            task_weights,
+            one_shot_tasks,
+            one_shot_weights,
+            rescued,
+        ) = _filter_untunable_tasks(tasks, task_weights, min_flop)
+        # Always name what was diverted: a silent cap reads as "covered everything".
+        logger.warning(
+            "[ms-skip-untunable] %d task(s) have a single-point design space and will be "
+            "MEASURED ONCE instead of searched (FLOP prefilter %s); %d task(s) go to search%s",
+            len(one_shot_tasks),
+            min_flop,
+            len(tasks),
+            ("\n" + "\n".join(f"    one-shot {t.task_name}" for t in one_shot_tasks))
+            if one_shot_tasks
+            else "",
+        )
+        if rescued:
+            # Low FLOP but a real search space -- kept on purpose, say so out loud.
+            logger.warning(
+                "[ms-skip-untunable] kept %d low-FLOP task(s) that DO have a search space:\n%s",
+                len(rescued),
+                "\n".join(
+                    f"    keep {name} (FLOP={flop:.0f}, decisions={dec})"
+                    for name, flop, dec in rescued
+                ),
+            )
+        if not tasks and not one_shot_tasks:
+            logger.warning("[ms-skip-untunable] nothing left to tune")
+            return database
     cost_model_reuse_path = None
     cost_model_was_loaded = False
     if not isinstance(cost_model, CostModel):
@@ -314,6 +471,41 @@ def tune_tasks(
         measure_callbacks = MeasureCallback.create(measure_callbacks)
     if not isinstance(task_scheduler, TaskScheduler):
         task_scheduler = TaskScheduler.create(task_scheduler)
+
+    if one_shot_tasks:
+        # Replay the design space trace once per task and measure it. Evolutionary
+        # search would instead replay a whole population and then burn
+        # num_empty_iters_before_early_stop full-cost empty rounds -- that is the
+        # "hours". Replay-trace with a 1-trial cap lands the same schedule in seconds.
+        one_shot_ctxs = [
+            TuneContext(
+                mod=t.mod,
+                target=t.target,
+                space_generator=t.space_generator.clone(),
+                search_strategy="replay-trace",
+                task_name=t.task_name,
+                rand_state=t.rand_state,
+                num_threads=t.num_threads,
+            )
+            for t in one_shot_tasks
+        ]
+        task_scheduler.tune(
+            tasks=one_shot_ctxs,
+            task_weights=one_shot_weights,
+            max_trials_global=len(one_shot_ctxs),
+            max_trials_per_task=1,
+            num_trials_per_iter=1,
+            builder=builder,
+            runner=runner,
+            measure_callbacks=measure_callbacks,
+            database=database,
+            cost_model=cost_model,
+        )
+        logger.warning(
+            "[ms-skip-untunable] one-shot measurement done for %d task(s)", len(one_shot_ctxs)
+        )
+        if not tasks:
+            return database
 
     def _run_tune(budget: int) -> None:
         task_scheduler.tune(
