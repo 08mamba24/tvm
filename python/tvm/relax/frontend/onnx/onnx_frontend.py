@@ -36,6 +36,7 @@ github.com/apache/tvm/issues if you hit an error with dynamic kernels.
 """
 import math
 import operator
+import os
 import re
 import warnings
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -268,9 +269,19 @@ def get_info(
     """
     shape = []
     shape_name = []
+    # TVM_ONNX_STATIC_ZERO_DIM=1: 显式声明的 dim_value=0（proto oneof 已置位）
+    # 按静态 0 导入，而不是转成匿名 SizeVar。
+    # 否则空维变成符号维：1) 逃过 legalize 层对静态 0 reduction 维的零填充守卫
+    # （上游 #19680），空 reduction 输出暴露未初始化内存；2) 所有输入的匿名维
+    # 共享同一个 SizeVar，被错误假定等长。默认关闭（零漂移）。
+    static_zero_dim = os.environ.get("TVM_ONNX_STATIC_ZERO_DIM", "0") == "1"
     for dim in info_proto.type.tensor_type.shape.dim:
         name = dim.dim_param
         value = dim.dim_value
+        if static_zero_dim and value == 0 and dim.WhichOneof("value") == "dim_value":
+            shape_name.append(value)
+            shape.append(value)
+            continue
         if value is None or value == 0:
             value = parse_shape_name(name, value_dict)
             shape_name.append(name)
