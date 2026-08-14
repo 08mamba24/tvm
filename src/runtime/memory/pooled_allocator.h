@@ -27,6 +27,7 @@
 #include <tvm/runtime/memory/memory_manager.h>
 
 #include <atomic>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -53,6 +54,9 @@ class PooledAllocator : public Allocator {
       auto&& pool = it->second;
       auto ret = pool.back();
       pool.pop_back();
+      // Zero-initialize reused memory to prevent stale data
+      // from previous inferences affecting subsequent results.
+      std::memset(ret.data, 0, ret.size);
       return ret;
     }
     Buffer buf;
