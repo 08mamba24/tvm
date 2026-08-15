@@ -893,6 +893,9 @@ class Gather(OnnxOpConverter):
 
         # If input is a shape expression, take a value from that shape and return it as a constant.
         if isinstance(data, relax.ShapeExpr):
+            # Resolve initializer-backed (and Cast-wrapped) indices under
+            # keep_params_in_input=True — the DIN Shape->Gather(idx=init) idiom.
+            indices = resolve_static_input_through_cast(indices, params)
             assert isinstance(
                 indices, relax.Constant
             ), "Only constant indices supported for shape gather."
@@ -2109,7 +2112,10 @@ class Expand(OnnxOpConverter):
     @classmethod
     def _impl_v13(cls, bb, inputs, attr, params):
         data = inputs[0]
-        shape = inputs[1]
+        # Resolve initializer-backed (and Cast-wrapped) shapes under
+        # keep_params_in_input=True so the static-shape paths below survive
+        # instead of silently downgrading to the dynamic tensor_to_shape path.
+        shape = resolve_static_input_through_cast(inputs[1], params)
         if isinstance(shape, relax.ShapeExpr):
             data_shape = list(data.struct_info.shape)
             target_shape = list(shape.values)
@@ -3047,9 +3053,10 @@ class ReduceLogSum(OnnxOpConverter):
         # If axes is empty and noop_with_empty_axes is 0, reduce all dimensions
         if not axes and not noop_with_empty_axes:
             return relax.op.log(relax.op.sum(data, None, keepdims))
-        # If axes is empty and noop_with_empty_axes is 1, return the input data unchanged.
+        # noop_with_empty_axes=1 skips the reduction but keeps the elementwise
+        # inner transform (onnx#6103 final ruling, spec rewrite onnx#7137).
         elif not axes and noop_with_empty_axes:
-            return data
+            return relax.op.log(data)
         # If axes is provided, reduce over the specified axes
         else:
             return relax.op.log(relax.op.sum(data, axes, keepdims))
@@ -3081,9 +3088,10 @@ class ReduceSumSquare(OnnxOpConverter):
         # If axes is empty and noop_with_empty_axes is 0, reduce all dimensions
         if not axes and not noop_with_empty_axes:
             return relax.op.sum(relax.op.multiply(data, data), None, keepdims)
-        # If axes is empty and noop_with_empty_axes is 1, return the input data unchanged.
+        # noop_with_empty_axes=1 skips the reduction but keeps the elementwise
+        # inner transform (onnx#6103 final ruling, spec rewrite onnx#7137).
         elif not axes and noop_with_empty_axes:
-            return data
+            return relax.op.multiply(data, data)
         # If axes is provided, reduce over the specified axes
         else:
             return relax.op.sum(relax.op.multiply(data, data), axes, keepdims)
@@ -3115,9 +3123,10 @@ class ReduceL1(OnnxOpConverter):
         # If axes is empty and noop_with_empty_axes is 0, reduce all dimensions
         if not axes and not noop_with_empty_axes:
             return relax.op.sum(relax.op.abs(data), None, keepdims)
-        # If axes is empty and noop_with_empty_axes is 1, return the input data unchanged.
+        # noop_with_empty_axes=1 skips the reduction but keeps the elementwise
+        # inner transform (onnx#6103 final ruling, spec rewrite onnx#7137).
         elif not axes and noop_with_empty_axes:
-            return data
+            return relax.op.abs(data)
         # If axes is provided, reduce over the specified axes
         else:
             return relax.op.sum(relax.op.abs(data), axes, keepdims)
@@ -3149,9 +3158,10 @@ class ReduceL2(OnnxOpConverter):
         # If axes is empty and noop_with_empty_axes is 0, reduce all dimensions
         if not axes and not noop_with_empty_axes:
             return relax.op.sqrt(relax.op.sum(relax.op.multiply(data, data), None, keepdims))
-        # If axes is empty and noop_with_empty_axes is 1, return the input data unchanged.
+        # noop_with_empty_axes=1 skips the reduction but keeps the elementwise
+        # inner transform: sqrt(x*x) == |x| (onnx#6103 final ruling, spec onnx#7137).
         elif not axes and noop_with_empty_axes:
-            return data
+            return relax.op.abs(data)
         # If axes is provided, reduce over the specified axes
         else:
             return relax.op.sqrt(relax.op.sum(relax.op.multiply(data, data), axes, keepdims))
@@ -3522,19 +3532,38 @@ class SequenceEmpty(OnnxOpConverter):
         return relax.Tuple([])
 
 
+def _sequence_to_expr_list(seq) -> List[relax.Expr]:
+    """Normalize an ONNX sequence value to a python list of relax exprs.
+
+    A sequence may arrive as a relax.Tuple (SequenceConstruct/Insert paths) or
+    as any expr with TupleStructInfo (e.g. the relax.op.split Call produced by
+    SplitToSequence) — the converters below must not assume len() works on it.
+    """
+    if isinstance(seq, relax.Tuple):
+        return list(seq.fields)
+    if isinstance(seq, (list, tuple)):
+        return list(seq)
+    sinfo = getattr(seq, "struct_info", None)
+    if isinstance(sinfo, relax.TupleStructInfo):
+        return [seq[i] for i in range(len(sinfo.fields))]
+    raise NotImplementedError(f"Cannot interpret {type(seq)} as an ONNX sequence")
+
+
 class SequenceErase(OnnxOpConverter):
     """Operator converter for sequence erase op."""
 
     @classmethod
     def _impl_v11(cls, bb, inputs, attr, params):
         # Erase tensor from sequence on specified position
-        input_sequence = inputs[0]
+        input_sequence = _sequence_to_expr_list(inputs[0])
 
         if len(inputs) == 2:
             position = inputs[1]
             # Non constant position is not supported.
             if isinstance(position, relax.Constant):
-                position = int(position.data.numpy())
+                # .item() also accepts the 1-D single-element form; a bare
+                # int() on it is a hard TypeError since numpy 2.4.
+                position = int(position.data.numpy().item())
             else:
                 raise NotImplementedError("Position must be a constant.")
         else:
@@ -3560,14 +3589,16 @@ class SequenceInsert(OnnxOpConverter):
     @classmethod
     def _impl_v11(cls, bb, inputs, attr, params):
         # Insert a new tensor into a tuple of tensors.
-        input_sequence = inputs[0]
+        input_sequence = _sequence_to_expr_list(inputs[0])
         tensor_to_insert = inputs[1]
 
         if len(inputs) == 3:
             position = inputs[2]
             # Non constant position is not supported.
             if isinstance(position, relax.Constant):
-                position = position.data.numpy()
+                # .item() also accepts the 1-D single-element form; comparing /
+                # list.insert-ing a bare array breaks (hard error on numpy>=2.4).
+                position = int(position.data.numpy().item())
             else:
                 raise NotImplementedError("Position must be a constant.")
         else:
@@ -3589,7 +3620,7 @@ class SequenceLength(OnnxOpConverter):
     @classmethod
     def _impl_v11(cls, bb, inputs, attr, params):
         # Get length of input sequence
-        return relax.const(len(inputs[0]), dtype="int64")
+        return relax.const(len(_sequence_to_expr_list(inputs[0])), dtype="int64")
 
 
 class ConcatFromSequence(OnnxOpConverter):
@@ -3628,11 +3659,25 @@ class SplitToSequence(OnnxOpConverter):
                 raise ValueError("Only constant split supported for SplitToSequence")
             split = split.data.numpy()
 
-        if len(split.shape) == 1 and split.shape[0] > 1:
-            split = _np.cumsum(split)
-            split = list(split[:-1])
+        if len(split.shape) == 1:
+            # Per spec a 1-D split is an explicit size list — even with a single
+            # element (routing shape-[1] into the chunk branch both mis-read the
+            # semantics and hard-crashed int(array) on numpy>=2.4).
+            sizes = split.tolist()
+            dim_size = input_shape[axis]
+            if isinstance(dim_size, tir.IntImm) and sum(sizes) != int(dim_size):
+                raise ValueError(
+                    f"SplitToSequence split sizes {sizes} must sum to dimension "
+                    f"{int(dim_size)} along axis {axis}"
+                )
+            if len(sizes) == 1:
+                # Single explicit size covering the whole axis: relax.op.split
+                # with no indices collapses to a plain tensor, so build the
+                # one-element sequence explicitly.
+                return relax.Tuple([input_tensor])
+            split = list(_np.cumsum(sizes)[:-1])
         else:
-            chunk_size, dim_size = int(split), input_shape[axis]
+            chunk_size, dim_size = int(split.item()), input_shape[axis]
             if dim_size % chunk_size != 0:
                 raise ValueError(
                     f"Dimension of size {dim_size} along axis {axis} must be "
@@ -3654,7 +3699,9 @@ class SequenceAt(OnnxOpConverter):
         assert isinstance(
             position, relax.Constant
         ), "Only constant position supported for SequenceAt"
-        position = int(position.data.numpy())
+        # .item() also accepts the 1-D single-element form; a bare int() on it
+        # is a hard TypeError since numpy 2.4.
+        position = int(position.data.numpy().item())
         return input_sequence[position]
 
 
@@ -4112,7 +4159,12 @@ class ONNXGraphImporter:
             # Create variables for constants.
             if self._keep_params_in_input:
                 # Pytorch sometimes inserts silly weight prefix. Remove it.
-                var_name = init_tensor.name.strip("onnx::")
+                # NOTE: must be a prefix removal — str.strip("onnx::") strips the
+                # CHARACTER SET {o,n,x,:} from both ends and silently mangles
+                # names like "idx"->"id" or "norm"->"rm".
+                var_name = init_tensor.name
+                if var_name.startswith("onnx::"):
+                    var_name = var_name[len("onnx::") :]
                 init_var = self._new_var(var_name, shape=array.shape, dtype=array.dtype)
                 self._nodes[init_tensor.name] = init_var
                 # We need to keep track of both the real value and variable for this variable.
